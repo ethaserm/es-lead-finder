@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -143,7 +144,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(lf.companies_house_check(lead, S(), "k"), "Ltd (active) 123")
 
     def test_clean_secret_strips_bom_and_whitespace(self):
-        self.assertEqual(lf.clean_secret("﻿ abc\r\n"), "abc")
+        self.assertEqual(lf.clean_secret("\ufeff \u200b abc\r\n"), "abc")
         self.assertEqual(lf.clean_secret(None), "")
 
     def test_chain_exclusion(self):
@@ -246,19 +247,73 @@ class Tests(unittest.TestCase):
                 break
         self.assertEqual(len(seen), total)
 
-    def test_workflow_schedule_and_limits(self):
+    def _workflow_text(self):
         path = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "leadfinder.yml")
         with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-        cron = re.search(r'cron:\s*"(\S+) (\S+) \* \* (\S+)"', text)
-        hours = [int(h) for h in cron.group(2).split(",")]
-        self.assertEqual(len(hours), 8)
-        self.assertEqual(len({b - a for a, b in zip(hours, hours[1:])}), 1)  # evenly spaced
-        self.assertEqual(cron.group(3), "1-5")  # weekdays only
-        timeout = int(re.search(r"timeout-minutes:\s*(\d+)", text).group(1))
-        self.assertEqual(timeout, 8)
-        runs_per_month = 8 * 5 * 52 / 12
-        self.assertLess(runs_per_month * timeout, 1500)  # even if every run hit the timeout
+            return fh.read()
+
+    def test_workflow_schedule_and_limits(self):
+        text = self._workflow_text()
+        cron = re.search(r'cron:\s*"(\S+) (\S+) (\S+) (\S+) (\S+)"', text).groups()
+        self.assertEqual(cron[1:], ("*", "*", "*", "*"))  # every hour, every day of the week
+        self.assertRegex(cron[0], r"^\d+$")  # one fixed minute, not top of the hour
+        self.assertNotEqual(cron[0], "0")
+        env = {k: int(v) for k, v in re.findall(r'^\s+([A-Z_]+):\s*"(\d+)"', text, re.M)}
+        self.assertEqual(env["COMBOS_PER_RUN"], 30)
+        self.assertGreaterEqual(env["MAX_NEW_PER_RUN"], 500)
+        self.assertGreaterEqual(env["MAX_SITES_PER_RUN"], 400)
+        timeout = int(re.search(r"timeout-minutes:\s*(\d+)", text).group(1)) * 60
+        # Overpass phase < whole-run budget; budget + Companies House grace + setup fits the job timeout
+        self.assertLess(env["OVERPASS_BUDGET_SECONDS"], env["RUN_BUDGET_SECONDS"])
+        self.assertLess(env["RUN_BUDGET_SECONDS"] + lf.CH_GRACE_SECONDS + 120, timeout)
+        self.assertLess(timeout, 3600)  # a run must finish before the next hourly one starts
+
+    def test_artifact_only_uploaded_while_repo_is_private(self):
+        text = self._workflow_text()
+        self.assertEqual(text.count("github.event.repository.private == true"), 2)
+
+    def test_repo_files_hold_no_secrets_or_sheet_ids(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        bad = [r"private_key", r"BEGIN (RSA |EC )?PRIVATE", r"1[A-Za-z0-9_-]{43}",
+               r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", r"iam\.gserviceaccount"]
+        for rel in ("README.md", "leadfinder.py", "config.json", ".gitignore",
+                    ".github/workflows/leadfinder.yml"):  # this test file holds the patterns themselves
+            with open(os.path.join(root, rel), encoding="utf-8") as fh:
+                text = fh.read()
+            for pat in bad:
+                self.assertIsNone(re.search(pat, text), f"{rel} matches {pat}")
+
+    def test_crawl_emails_runs_sites_in_parallel_and_survives_errors(self):
+        import threading
+        leads = [lf.Lead(f"B{i}", "x", "y", f"http://site{i}.co.uk") for i in range(6)]
+        started, gate = set(), threading.Barrier(3, timeout=5)
+
+        class C:
+            def find_email(_, url):
+                if "site0" in url:
+                    raise ValueError("boom")
+                started.add(threading.get_ident())
+                if "site1" in url or "site2" in url or "site3" in url:
+                    gate.wait()  # only passes if three sites are being fetched at the same time
+                return "info@" + url.split("//")[1].rstrip("/")
+        with mock.patch.object(lf, "log"):
+            out = lf.crawl_emails(C(), leads, 4, time.monotonic() + 30)
+        self.assertEqual(len(out), 6)
+        self.assertEqual(out[id(leads[0])], "")  # the error became "no email"
+        self.assertEqual(out[id(leads[5])], "info@site5.co.uk")
+        self.assertGreaterEqual(len(started), 3)
+
+    def test_crawl_emails_stops_at_the_deadline(self):
+        leads = [lf.Lead("B", "x", "y", "http://slow.co.uk")]
+
+        class C:
+            def find_email(_, url):
+                time.sleep(1.5)
+                return "a@slow.co.uk"
+        with mock.patch.object(lf, "log") as lg:
+            out = lf.crawl_emails(C(), leads, 1, time.monotonic() + 0.2)
+        self.assertEqual(out, {})
+        self.assertTrue(any("budget used up" in c.args[0] for c in lg.call_args_list))
 
     def test_failed_searches_are_retried_first_next_run(self):
         cfg = {"trades": [{"label": "a"}, {"label": "b"}, {"label": "c"}], "towns": ["x", "y"]}
@@ -329,11 +384,24 @@ class Tests(unittest.TestCase):
                 mock.patch.object(lf.SiteCrawler, "find_email", return_value="info@foo.co.uk"), \
                 mock.patch.object(lf, "companies_house_check", return_value="Ltd (active) 123"), \
                 mock.patch.object(lf, "companies_house_self_test", return_value=True), \
-                mock.patch.object(lf, "load_state", return_value={"cursor": 0}):
+                mock.patch.object(lf, "load_state", return_value={"cursor": 0}),                 mock.patch.object(lf, "log") as lg:
             os.environ.pop("SHEET_ID", None)
             os.environ.pop("GOOGLE_SERVICE_ACCOUNT_JSON", None)
             n = lf.run(True, 1, 10)
         self.assertEqual(n, 1)  # merged duplicate, dropped no-site + social-only
+        logged = " | ".join(str(c.args[0]) for c in lg.call_args_list)
+        self.assertNotIn("info@foo.co.uk", logged)  # lead emails never reach the (possibly public) log
+        self.assertIn("[foo.co.uk]", logged)
+
+    def test_only_confirmed_active_ltd_is_pending(self):
+        ltd = lf.Lead("A", "x", "y")
+        ltd.company = "Ltd (active) 01234567"
+        other = lf.Lead("B", "x", "y")
+        self.assertEqual(lf.lead_status(ltd, "key"), "Pending")
+        self.assertEqual(lf.lead_status(other, "key"), "Review - not confirmed Ltd")
+        other.company = "Not confirmed"
+        self.assertEqual(lf.lead_status(other, "key"), "Review - not confirmed Ltd")
+        self.assertEqual(lf.lead_status(ltd, ""), "Review - no Companies House check")  # key rejected/missing
 
 
 if __name__ == "__main__":

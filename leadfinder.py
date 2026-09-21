@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from datetime import date
 from urllib import robotparser
 from urllib.parse import urljoin, urlparse
@@ -49,7 +50,8 @@ OVERPASS_BACKOFF_CAP = 10
 OVERPASS_QUERY_DELAY = 4      # polite pause after every query
 OVERPASS_REQUEST_TIMEOUT = (5, 25)  # connect, read: cap each attempt at ~25s
 OVERPASS_SERVER_TIMEOUT = 20  # seconds the Overpass server may spend on a query
-PLACE_RADIUS_M = 3000         # search radius around a town's place node when it has no boundary
+CH_GRACE_SECONDS = 90         # extra time after the crawl budget for Companies House checks
+PLACE_RADIUS_M = 3000        # search radius around a town's place node when it has no boundary
 _overpass_next = 0
 _overpass_deadline = None     # time.monotonic() after which Overpass searches are skipped
 
@@ -142,7 +144,7 @@ def clean_site(url):
 
 def clean_secret(value):
     """Strip whitespace and any BOM/zero-width marker from a secret."""
-    return (value or "").replace("﻿", "").replace("​", "").strip()
+    return (value or "").replace("\ufeff", "").replace("\u200b", "").strip()
 
 
 def _words(text):
@@ -643,6 +645,42 @@ def pick_with_retries(cfg, state, count):
     return picks, next_cursor
 
 
+def crawl_emails(crawler, leads, workers, deadline):
+    """Find on-site emails for many sites at once. Returns {id(lead): email} for finished sites.
+
+    Sites are fetched in parallel, but SiteCrawler still waits 1s between hits to the same host
+    and honours robots.txt. Sites not finished by the deadline are dropped and found again later.
+    """
+    def work(lead):
+        try:
+            return crawler.find_email(lead.website)
+        except Exception as exc:  # one bad site must not stop the run
+            log(f"    crawl error on {host_of(lead.website)}: {type(exc).__name__}")
+            return ""
+
+    results = {}
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    futures = {pool.submit(work, lead): lead for lead in leads}
+    try:
+        for fut in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+            results[id(futures[fut])] = fut.result()
+    except FuturesTimeout:
+        log("run time budget used up; stopping the crawl early")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
+def lead_status(lead, ch_key, only_ltd=True):
+    """Pending only for a business confirmed as an active limited company by Companies House."""
+    confirmed = lead.company.startswith("Ltd")
+    if ch_key and (confirmed or not only_ltd):
+        return "Pending"
+    if ch_key:
+        return "Review - not confirmed Ltd"
+    return "Review - no Companies House check"
+
+
 def next_retry_queue(failed, state):
     already_retried = {tuple(x) for x in state.get("retry", [])}
     return [f for f in failed if tuple(f) not in already_retried]
@@ -736,33 +774,29 @@ def run(dry_run, combos_per_run, max_new):
     log(f"with a website and not already contacted/queued: {len(candidates)}")
 
     crawler = SiteCrawler(session)
-    new_leads, crawled = [], 0
+    found_emails = crawl_emails(crawler, candidates[:max_sites], env_int("CRAWL_WORKERS", 8), run_deadline)
+    crawled = len(found_emails)
+    new_leads = []
     for lead in candidates:
-        if len(new_leads) >= max_new or crawled >= max_sites:
+        if len(new_leads) >= max_new:
             break
-        if time.monotonic() >= run_deadline:
-            log("run time budget used up; stopping the crawl early")
-            break
-        crawled += 1
-        email = crawler.find_email(lead.website)
+        email = found_emails.get(id(lead), "")
         if not email or email in known_emails:
             continue
+        if ch_key and time.monotonic() >= run_deadline + CH_GRACE_SECONDS:
+            log("out of time for Companies House checks; remaining leads left for a later run")
+            break
         lead.email = email
         known_emails.add(email)
         if ch_key:
             lead.company = companies_house_check(lead, session, ch_key)
         new_leads.append(lead)
-        log(f"  + {lead.name} <{email}> {lead.company or '(not confirmed Ltd)'}")
+        # emails stay out of the log: Actions logs can be public
+        log(f"  + {lead.name} [{host_of(lead.website)}] {lead.company or '(not confirmed Ltd)'}")
 
     rows, preview = [], []
     for lead in new_leads:
-        confirmed = lead.company.startswith("Ltd")
-        if ch_key and (confirmed or not only_ltd):
-            status = "Pending"
-        elif ch_key:
-            status = "Review - not confirmed Ltd"
-        else:
-            status = "Review - no Companies House check"
+        status = lead_status(lead, ch_key, only_ltd)
         rows.append(row_for(lead, header, status))
         preview.append([lead.name, lead.trade, lead.area, lead.website, lead.email,
                         lead.company or "Not confirmed", status, ", ".join(sorted(lead.sources))])

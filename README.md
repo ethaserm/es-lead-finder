@@ -1,6 +1,6 @@
 # ES Agents lead finder
 
-Finds small UK businesses from several free sources, merges them, pulls a real email from each business's own website, checks Companies House, and appends the new ones to the **Business Queue** tab of your outreach sheet. Runs on GitHub Actions 5 times a day (Mon-Fri).
+Finds small UK businesses from several free sources, merges them, pulls a real email from each business's own website, checks Companies House, and appends the new ones to the **Business Queue** tab of your outreach sheet. Runs on GitHub Actions every hour, every day.
 
 ## Setup (about 20 minutes)
 
@@ -9,11 +9,11 @@ Finds small UK businesses from several free sources, merges them, pulls a real e
 3. **Companies House key.** Register at the Companies House Developer Hub, create an application, and create a *REST* API key. Without this key every lead is marked `Review`, never `Pending`.
 4. **Google Places key (optional).** Create an API key restricted to the Places API and set a billing budget/alert in Google Cloud. `GOOGLE_MAX_REQUESTS` (default 12 per run) caps how many searches each run makes.
 5. **Repo secrets** (Settings > Secrets and variables > Actions):
-   - `SHEET_ID` = `1VLX7qJ8Gl4n4IjiR9-TVRqFHVmlzM0LZ8DgvIZnT9bs`
+   - `SHEET_ID` = the ID from your sheet's URL (the part between `/d/` and `/edit`)
    - `GOOGLE_SERVICE_ACCOUNT_JSON` = the full contents of the JSON key
    - `COMPANIES_HOUSE_API_KEY`
    - `GOOGLE_PLACES_API_KEY` (optional)
-6. **Test.** Actions tab > *Lead finder* > *Run workflow* with *Dry run* ticked. Open the `lead-preview` artifact to see what it would have added. Then untick dry run for a real run.
+6. **Test.** Actions tab > *Lead finder* > *Run workflow* with *Dry run* ticked. Open the `lead-preview` artifact to see what it would have added (only uploaded while the repo is private, because it contains scraped emails). Then untick dry run for a real run.
 
 ## What it does with each business
 

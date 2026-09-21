@@ -2,9 +2,8 @@ name: Lead finder
 
 on:
   schedule:
-    # 8 runs a day, Mon-Fri (UTC), every 2 hours from 06:17 to 20:17. Odd minute avoids
-    # GitHub's busy top-of-hour queue.
-    - cron: "17 6,8,10,12,14,16,18,20 * * 1-5"
+    # Every hour, every day (UTC). Odd minute avoids GitHub's busy top-of-hour queue.
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -22,7 +21,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -40,17 +39,20 @@ jobs:
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
           COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          COMBOS_PER_RUN: "14"
-          OVERPASS_BUDGET_SECONDS: "240"
-          RUN_BUDGET_SECONDS: "330"
-          MAX_NEW_PER_RUN: "40"
+          COMBOS_PER_RUN: "30"
+          OVERPASS_BUDGET_SECONDS: "480"
+          RUN_BUDGET_SECONDS: "660"
+          MAX_SITES_PER_RUN: "400"
+          CRAWL_WORKERS: "8"
+          MAX_NEW_PER_RUN: "1000"
           GOOGLE_MAX_REQUESTS: "12"
           PENDING_ONLY_IF_LTD: "true"
         run: python leadfinder.py
 
+      # The CSV holds scraped business emails, so only keep it as an artifact while the repo is private.
       - name: Upload preview CSV
         id: upload
-        if: always()
+        if: always() && github.event.repository.private == true
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -59,7 +61,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload preview CSV (retry)
-        if: always() && steps.upload.outcome == 'failure'
+        if: always() && github.event.repository.private == true && steps.upload.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: lead-preview

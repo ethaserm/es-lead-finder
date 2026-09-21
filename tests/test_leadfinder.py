@@ -200,6 +200,34 @@ class Tests(unittest.TestCase):
         self.assertIn("bad *** here", lg.call_args.args[0])
         self.assertIsNone(lf.companies_house_self_test(sess(500), "k"))
 
+    def test_key_shape_hides_key_and_flags_problems(self):
+        good = lf.key_shape("abcd-1234")
+        self.assertIn("length=9", good)
+        self.assertNotIn("abcd", good)
+        for bad, flag in (('"k1"', "quotes=True"), ("k 1", "whitespace=True"),
+                          ("KEY=k1", "equals=True"), ("ké", "non_ascii=True"),
+                          ("k\x001", "control=True")):
+            self.assertIn(flag, lf.key_shape(bad))
+        self.assertNotIn("quotes=True", good)
+
+    def test_companies_house_uses_basic_auth_key_as_username(self):
+        seen = []
+
+        class S:
+            def get(_, *a, **k):
+                seen.append(k.get("auth"))
+                r = FakeResp()
+                r.status_code = 200
+                r.text = ""
+                r.json = lambda: {"items": []}
+                return r
+        with mock.patch("time.sleep"), mock.patch.object(lf, "log"):
+            lf.companies_house_self_test(S(), "thekey")
+            lf.companies_house_check(lf.Lead("Foo", "x", "y"), S(), "thekey")
+        self.assertEqual(seen, [("thekey", ""), ("thekey", "")])
+        prepared = lf.requests.Request("GET", "https://x", auth=("thekey", "")).prepare()
+        self.assertEqual(prepared.headers["Authorization"], "Basic dGhla2V5Og==")  # base64("thekey:")
+
     def test_end_to_end_dry_run(self):
         leads = [
             lf.Lead("Foo Plumbing Ltd", "Plumber", "York", "http://foo.co.uk", source="OpenStreetMap"),

@@ -326,11 +326,23 @@ def google_leads(trade, town, session, api_key, budget, pages=1):
 
 
 # --------------------------------------------------------------------------- source 3: Companies House
+def key_shape(key):
+    """Describe a key without revealing it: length and suspicious characters."""
+    quote_chars = "\"'`"
+    return (
+        f"length={len(key)} quotes={any(c in key for c in quote_chars)} "
+        f"whitespace={any(c.isspace() for c in key)} equals={'=' in key} "
+        f"non_ascii={any(ord(c) > 127 for c in key)} "
+        f"control={any(ord(c) < 32 or ord(c) == 127 for c in key)}"
+    )
+
+
 def companies_house_self_test(session, api_key):
     """Search 'Tesco' and log only the HTTP status and whether the key was accepted.
 
     Returns True (accepted), False (rejected: 400/401/403) or None (inconclusive).
     """
+    log(f"companies house key shape: {key_shape(api_key)}")
     try:
         resp = session.get(
             "https://api.company-information.service.gov.uk/search/companies",

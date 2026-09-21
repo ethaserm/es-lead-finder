@@ -1,0 +1,61 @@
+name: Lead finder
+
+on:
+  schedule:
+    # 5 runs a day, Mon-Fri (UTC). Odd minutes avoid GitHub's busy top-of-hour queue.
+    - cron: "17 6,9,12,15,18 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (do not write to the Sheet)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # lets the job commit state.json so scheduled runs never go stale
+
+concurrency:
+  group: lead-finder
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Find leads
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+          COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          COMBOS_PER_RUN: "6"
+          MAX_NEW_PER_RUN: "40"
+          GOOGLE_MAX_REQUESTS: "12"
+          PENDING_ONLY_IF_LTD: "true"
+        run: python leadfinder.py
+
+      - name: Upload preview CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lead-preview
+          path: output/*.csv
+          if-no-files-found: ignore
+
+      - name: Save rotation state
+        run: |
+          git config user.name "leadfinder-bot"
+          git config user.email "leadfinder-bot@users.noreply.github.com"
+          git add state.json || true
+          git diff --staged --quiet || (git commit -m "Update lead finder state" && git push)

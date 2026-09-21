@@ -1,0 +1,26 @@
+{
+  "queue_tab": "Business Queue",
+  "tracker_tab": "Outreach Tracker",
+  "trades": [
+    {"label": "Electrician", "osm": [["craft", "electrician"]], "places": "electricians"},
+    {"label": "Plumber", "osm": [["craft", "plumber"]], "places": "plumbers"},
+    {"label": "Roofer", "osm": [["craft", "roofer"]], "places": "roofers"},
+    {"label": "Heating / HVAC", "osm": [["craft", "hvac"]], "places": "heating engineers"},
+    {"label": "Carpenter", "osm": [["craft", "carpenter"]], "places": "carpenters and joiners"},
+    {"label": "Locksmith", "osm": [["shop", "locksmith"], ["craft", "locksmith"]], "places": "locksmiths"},
+    {"label": "Gardener / Landscaper", "osm": [["craft", "gardener"]], "places": "landscape gardeners"},
+    {"label": "Pest control", "osm": [], "places": "pest control"},
+    {"label": "Removals", "osm": [], "places": "removal companies"},
+    {"label": "Cleaner", "osm": [], "places": "cleaning services"},
+    {"label": "Hair salon / Barber", "osm": [["shop", "hairdresser"]], "places": "hair salons and barbers"},
+    {"label": "Garage", "osm": [["shop", "car_repair"]], "places": "car garages"},
+    {"label": "Cafe", "osm": [["amenity", "cafe"]], "places": "cafes"},
+    {"label": "Vet", "osm": [["amenity", "veterinary"]], "places": "vets"}
+  ],
+  "towns": [
+    "York", "Harrogate", "Leeds", {"name": "Hull", "osm": "Kingston upon Hull"}, "Wetherby",
+    "Ripon", "Knaresborough", "Selby", "Thirsk", "Skipton", "Ilkley", "Beverley",
+    "Bridlington", "Scarborough", "Malton", "Wakefield", "Sheffield", "Bradford",
+    "Doncaster", "Halifax", "Huddersfield", "Pontefract", "Barnsley", "Rotherham"
+  ]
+}

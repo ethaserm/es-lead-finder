@@ -2,8 +2,9 @@ name: Lead finder
 
 on:
   schedule:
-    # 5 runs a day, Mon-Fri (UTC). Odd minutes avoid GitHub's busy top-of-hour queue.
-    - cron: "17 6,9,12,15,18 * * 1-5"
+    # 8 runs a day, Mon-Fri (UTC), every 2 hours from 06:17 to 20:17. Odd minute avoids
+    # GitHub's busy top-of-hour queue.
+    - cron: "17 6,8,10,12,14,16,18,20 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -39,7 +40,9 @@ jobs:
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
           COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          COMBOS_PER_RUN: "6"
+          COMBOS_PER_RUN: "14"
+          OVERPASS_BUDGET_SECONDS: "240"
+          RUN_BUDGET_SECONDS: "330"
           MAX_NEW_PER_RUN: "40"
           GOOGLE_MAX_REQUESTS: "12"
           PENDING_ONLY_IF_LTD: "true"

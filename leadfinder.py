@@ -49,6 +49,7 @@ OVERPASS_BACKOFF_CAP = 10
 OVERPASS_QUERY_DELAY = 4      # polite pause after every query
 OVERPASS_REQUEST_TIMEOUT = (5, 25)  # connect, read: cap each attempt at ~25s
 OVERPASS_SERVER_TIMEOUT = 20  # seconds the Overpass server may spend on a query
+PLACE_RADIUS_M = 3000         # search radius around a town's place node when it has no boundary
 _overpass_next = 0
 _overpass_deadline = None     # time.monotonic() after which Overpass searches are skipped
 
@@ -239,15 +240,19 @@ def overpass_query(query, session):
 
 
 def overpass_leads(trade, town, session):
-    filters = "".join(
-        f'nwr["{k}"="{v}"](area.a);' for k, v in trade.get("osm", [])
-    )
-    if not filters:
+    tags = trade.get("osm", [])
+    if not tags:
         return []
-    area_name = town["osm"] if isinstance(town, dict) else town
+    area_name = (town["osm"] if isinstance(town, dict) else town).replace("\\", "").replace('"', "")
+    bbox = ",".join(str(n) for n in UK_BBOX)
+    in_area = "".join(f'nwr["{k}"="{v}"](area.a);' for k, v in tags)
+    near_place = "".join(f'nwr["{k}"="{v}"](around.p:{PLACE_RADIUS_M});' for k, v in tags)
+    # Boundary area when OSM has one, else a radius around the town's place node; UK-only.
     query = (
-        f'[out:json][timeout:{OVERPASS_SERVER_TIMEOUT}];area["name"="{area_name}"]["boundary"="administrative"]->.a;'
-        f"({filters});out center tags;"
+        f'[out:json][timeout:{OVERPASS_SERVER_TIMEOUT}];'
+        f'rel["name"="{area_name}"]["boundary"="administrative"]({bbox});map_to_area->.a;'
+        f'node["name"="{area_name}"]["place"~"^(city|town)$"]({bbox})->.p;'
+        f"({in_area}{near_place});out center tags;"
     )
     data = overpass_query(query, session)
     time.sleep(OVERPASS_QUERY_DELAY)  # stay well inside the public servers' fair-use limits
@@ -638,6 +643,11 @@ def pick_with_retries(cfg, state, count):
     return picks, next_cursor
 
 
+def next_retry_queue(failed, state):
+    already_retried = {tuple(x) for x in state.get("retry", [])}
+    return [f for f in failed if tuple(f) not in already_retried]
+
+
 def run(dry_run, combos_per_run, max_new):
     global _overpass_deadline
     started = time.monotonic()
@@ -706,6 +716,9 @@ def run(dry_run, combos_per_run, max_new):
             else:
                 pool[lead.key] = lead
     log(f"searches skipped after failures: {len(failed)} of {len(picks)}")
+    # A search that already failed as a retry is not queued again, so a permanently
+    # failing one (e.g. a huge city) cannot keep taking slots from the rotation.
+    failed = next_retry_queue(failed, state)
     log(f"unique businesses this run: {len(pool)}")
 
     chains = chain_keys(cfg)

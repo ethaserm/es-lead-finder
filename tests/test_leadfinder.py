@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import unittest
 from unittest import mock
@@ -200,6 +201,64 @@ class Tests(unittest.TestCase):
             self.assertIsNone(lf.overpass_leads(trade, "York", None))
         with mock.patch.object(lf, "overpass_query", return_value={"elements": []}), mock.patch("time.sleep"):
             self.assertEqual(lf.overpass_leads(trade, "York", None), [])
+
+    def test_query_is_uk_only_with_place_fallback(self):
+        seen = []
+        trade = {"label": "Plumber", "osm": [["craft", "plumber"], ["shop", "x"]]}
+        with mock.patch.object(lf, "overpass_query", side_effect=lambda q, s: seen.append(q)), \
+                mock.patch("time.sleep"):
+            lf.overpass_leads(trade, 'Bo"ston', None)
+        q = seen[0]
+        self.assertIn("49.8,-8.7,60.9,1.8", q)  # restricted to the UK bounding box
+        self.assertIn("map_to_area->.a", q)
+        self.assertIn('"place"~"^(city|town)$"', q)
+        self.assertIn("(around.p:3000)", q)
+        self.assertIn('nwr["craft"="plumber"](area.a)', q)
+        self.assertNotIn('Bo"ston', q)  # quotes in names cannot break out of the query
+
+    def test_no_osm_tags_means_no_request(self):
+        with mock.patch.object(lf, "overpass_query", side_effect=AssertionError):
+            self.assertEqual(lf.overpass_leads({"label": "Cleaner", "osm": []}, "York", None), [])
+
+    def test_search_failing_on_its_retry_is_not_requeued(self):
+        state = {"retry": [["Plumber", "York"]]}
+        failed = [["Plumber", "York"], ["Garage", "Leeds"]]
+        self.assertEqual(lf.next_retry_queue(failed, state), [["Garage", "Leeds"]])
+
+    def test_config_covers_the_uk(self):
+        cfg = lf.load_config()
+        names = [t["name"] if isinstance(t, dict) else t for t in cfg["towns"]]
+        self.assertGreaterEqual(len(names), 300)
+        self.assertEqual(len(names), len(set(names)))
+        for must in ("York", "City of London", "Manchester", "Edinburgh",
+                     "Glasgow", "Cardiff", "Swansea", "Belfast", "Aberdeen", "Inverness", "Plymouth"):
+            self.assertIn(must, names)
+        self.assertEqual(len(cfg["trades"]), 14)
+        for trade in cfg["trades"]:
+            self.assertTrue({"label", "osm", "places"} <= set(trade))
+        # a full cycle is finite and the rotation walks every combination exactly once
+        total = len(cfg["towns"]) * len(cfg["trades"])
+        seen, cursor = set(), 0
+        while len(seen) < total:
+            picks, cursor = lf.pick_combos(cfg, cursor, 14)
+            seen |= {tuple(lf.combo_label(*p)) for p in picks}
+            if cursor == 0:
+                break
+        self.assertEqual(len(seen), total)
+
+    def test_workflow_schedule_and_limits(self):
+        path = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "leadfinder.yml")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        cron = re.search(r'cron:\s*"(\S+) (\S+) \* \* (\S+)"', text)
+        hours = [int(h) for h in cron.group(2).split(",")]
+        self.assertEqual(len(hours), 8)
+        self.assertEqual(len({b - a for a, b in zip(hours, hours[1:])}), 1)  # evenly spaced
+        self.assertEqual(cron.group(3), "1-5")  # weekdays only
+        timeout = int(re.search(r"timeout-minutes:\s*(\d+)", text).group(1))
+        self.assertEqual(timeout, 8)
+        runs_per_month = 8 * 5 * 52 / 12
+        self.assertLess(runs_per_month * timeout, 1500)  # even if every run hit the timeout
 
     def test_failed_searches_are_retried_first_next_run(self):
         cfg = {"trades": [{"label": "a"}, {"label": "b"}, {"label": "c"}], "towns": ["x", "y"]}

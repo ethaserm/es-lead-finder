@@ -173,14 +173,43 @@ class Tests(unittest.TestCase):
         self.assertEqual(data, {"elements": []})
         self.assertEqual(len(calls), 3)
         self.assertEqual(len(set(calls)), 3)  # each attempt hit a different mirror
-        self.assertEqual([c.args[0] for c in sl.call_args_list], [5, 10])  # exponential backoff
+        self.assertEqual([c.args[0] for c in sl.call_args_list], [2, 4])  # exponential backoff
 
-    def test_overpass_gives_up_after_all_attempts(self):
+    def test_overpass_gives_up_after_first_try_plus_two_retries(self):
+        calls = []
+
         class S:
             def post(_, url, **k):
+                calls.append(k["timeout"])
                 raise lf.requests.ConnectionError("x")
         with mock.patch("time.sleep"):
             self.assertIsNone(lf.overpass_query("q", S()))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0], (5, 25))  # each attempt capped at ~25s read
+
+    def test_overpass_skips_when_time_budget_used_up(self):
+        class S:
+            def post(_, *a, **k):
+                raise AssertionError("must not be called")
+        with mock.patch.object(lf, "_overpass_deadline", 0):
+            self.assertIsNone(lf.overpass_query("q", S()))
+
+    def test_failed_search_returns_none_not_empty(self):
+        trade = {"label": "Plumber", "osm": [["craft", "plumber"]]}
+        with mock.patch.object(lf, "overpass_query", return_value=None), mock.patch("time.sleep"):
+            self.assertIsNone(lf.overpass_leads(trade, "York", None))
+        with mock.patch.object(lf, "overpass_query", return_value={"elements": []}), mock.patch("time.sleep"):
+            self.assertEqual(lf.overpass_leads(trade, "York", None), [])
+
+    def test_failed_searches_are_retried_first_next_run(self):
+        cfg = {"trades": [{"label": "a"}, {"label": "b"}, {"label": "c"}], "towns": ["x", "y"]}
+        state = {"cursor": 0, "retry": [["c", "y"], ["zzz", "gone"]]}
+        picks, nxt = lf.pick_with_retries(cfg, state, 4)
+        self.assertEqual([lf.combo_label(*p) for p in picks],
+                         [["c", "y"], ["a", "x"], ["b", "x"], ["c", "x"]])
+        self.assertEqual(nxt, 3)  # rotation advanced only by the slots it used
+        picks, nxt = lf.pick_with_retries(cfg, {"cursor": 5}, 2)
+        self.assertEqual(len(picks), 2)
 
     def test_ch_self_test_statuses(self):
         def sess(code, text=""):

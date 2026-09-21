@@ -43,11 +43,14 @@ OVERPASS_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
-OVERPASS_ATTEMPTS = 5
-OVERPASS_BACKOFF_BASE = 5     # seconds; doubles each retry, capped below
-OVERPASS_BACKOFF_CAP = 60
-OVERPASS_QUERY_DELAY = 6      # polite pause after every query
+OVERPASS_ATTEMPTS = 3         # first try + at most 2 retries
+OVERPASS_BACKOFF_BASE = 2     # seconds; doubles each retry, capped below
+OVERPASS_BACKOFF_CAP = 10
+OVERPASS_QUERY_DELAY = 4      # polite pause after every query
+OVERPASS_REQUEST_TIMEOUT = (5, 25)  # connect, read: cap each attempt at ~25s
+OVERPASS_SERVER_TIMEOUT = 20  # seconds the Overpass server may spend on a query
 _overpass_next = 0
+_overpass_deadline = None     # time.monotonic() after which Overpass searches are skipped
 
 BLOCKED_SITE_HOSTS = (
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
@@ -201,11 +204,15 @@ def overpass_query(query, session):
     """POST a query, rotating mirrors and backing off exponentially on 429/5xx/timeouts."""
     global _overpass_next
     for attempt in range(OVERPASS_ATTEMPTS):
+        if _overpass_deadline is not None and time.monotonic() >= _overpass_deadline:
+            log("    overpass time budget used up; skipping")
+            return None
         url = OVERPASS_URLS[_overpass_next % len(OVERPASS_URLS)]
         host = host_of(url)
         retry = False
         try:
-            resp = session.post(url, data={"data": query}, headers={"User-Agent": UA}, timeout=(10, 90))
+            resp = session.post(url, data={"data": query}, headers={"User-Agent": UA},
+                                timeout=OVERPASS_REQUEST_TIMEOUT)
         except requests.RequestException as exc:
             log(f"    overpass {host} error: {type(exc).__name__}")
             retry = True
@@ -239,13 +246,13 @@ def overpass_leads(trade, town, session):
         return []
     area_name = town["osm"] if isinstance(town, dict) else town
     query = (
-        f'[out:json][timeout:60];area["name"="{area_name}"]["boundary"="administrative"]->.a;'
+        f'[out:json][timeout:{OVERPASS_SERVER_TIMEOUT}];area["name"="{area_name}"]["boundary"="administrative"]->.a;'
         f"({filters});out center tags;"
     )
     data = overpass_query(query, session)
     time.sleep(OVERPASS_QUERY_DELAY)  # stay well inside the public servers' fair-use limits
-    if not data:
-        return []
+    if data is None:
+        return None  # search failed; caller records it for a retry on a later run
     label = town["name"] if isinstance(town, dict) else town
     leads = []
     for el in data.get("elements", []):
@@ -612,7 +619,30 @@ def pick_combos(cfg, cursor, count):
     return picks, (cursor + count) % len(combos)
 
 
+def combo_label(trade, town):
+    return [trade["label"], town["name"] if isinstance(town, dict) else town]
+
+
+def pick_with_retries(cfg, state, count):
+    """Searches that failed last run go first (up to half the slots), then normal rotation."""
+    combos = [(t, town) for town in cfg["towns"] for t in cfg["trades"]]
+    by_label = {tuple(combo_label(t, town)): (t, town) for t, town in combos}
+    retries = []
+    for item in state.get("retry", []):
+        combo = by_label.get(tuple(item))
+        if combo and combo not in retries:
+            retries.append(combo)
+    retries = retries[:count // 2]
+    rotation, next_cursor = pick_combos(cfg, state.get("cursor", 0), count - len(retries))
+    picks = retries + [c for c in rotation if c not in retries]
+    return picks, next_cursor
+
+
 def run(dry_run, combos_per_run, max_new):
+    global _overpass_deadline
+    started = time.monotonic()
+    _overpass_deadline = started + env_int("OVERPASS_BUDGET_SECONDS", 240)
+    run_deadline = started + env_int("RUN_BUDGET_SECONDS", 380)
     cfg = load_config()
     session = requests.Session()
     google_key = clean_secret(os.environ.get("GOOGLE_PLACES_API_KEY"))
@@ -651,14 +681,19 @@ def run(dry_run, combos_per_run, max_new):
             sys.exit("Refusing to run without sheet credentials (use --dry-run to test).")
 
     state = load_state()
-    picks, next_cursor = pick_combos(cfg, state.get("cursor", 0), combos_per_run)
+    picks, next_cursor = pick_with_retries(cfg, state, combos_per_run)
 
-    pool = {}
+    pool, failed = {}, []
     for trade, town in picks:
         label = town["name"] if isinstance(town, dict) else town
         log(f"searching: {trade['label']} in {label}")
         found = overpass_leads(trade, town, session)
-        log(f"  openstreetmap: {len(found)}")
+        if found is None:
+            failed.append(combo_label(trade, town))
+            log("  openstreetmap: FAILED, skipped (will retry on the next run)")
+            found = []
+        else:
+            log(f"  openstreetmap: {len(found)}")
         if google_key:
             g = google_leads(trade, town, session, google_key, budget)
             log(f"  google places: {len(g)}")
@@ -670,6 +705,7 @@ def run(dry_run, combos_per_run, max_new):
                 existing.merge(lead)
             else:
                 pool[lead.key] = lead
+    log(f"searches skipped after failures: {len(failed)} of {len(picks)}")
     log(f"unique businesses this run: {len(pool)}")
 
     chains = chain_keys(cfg)
@@ -690,6 +726,9 @@ def run(dry_run, combos_per_run, max_new):
     new_leads, crawled = [], 0
     for lead in candidates:
         if len(new_leads) >= max_new or crawled >= max_sites:
+            break
+        if time.monotonic() >= run_deadline:
+            log("run time budget used up; stopping the crawl early")
             break
         crawled += 1
         email = crawler.find_email(lead.website)
@@ -731,6 +770,7 @@ def run(dry_run, combos_per_run, max_new):
         log(f"appended {len(rows)} rows to '{cfg['queue_tab']}'")
     if not dry_run:
         state["cursor"] = next_cursor
+        state["retry"] = failed
         save_state(state)
     return len(rows)
 

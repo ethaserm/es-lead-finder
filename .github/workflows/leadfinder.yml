@@ -46,7 +46,6 @@ jobs:
           CRAWL_WORKERS: "8"
           MAX_NEW_PER_RUN: "1000"
           GOOGLE_MAX_REQUESTS: "12"
-          PENDING_ONLY_IF_LTD: "true"
         run: python leadfinder.py
 
       # The CSV holds scraped business emails, so only keep it as an artifact while the repo is private.

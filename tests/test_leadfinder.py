@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import unittest
+from datetime import date
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -70,26 +71,6 @@ class Tests(unittest.TestCase):
         self.assertEqual(lf.decode_cf_email(enc), plain)
         self.assertIn(plain, lf.extract_emails(f'<a data-cfemail="{enc}">[email protected]</a>'))
 
-    def test_pick_email_prefers_own_domain(self):
-        emails = ["someone@gmail.com", "office@foo.co.uk"]
-        self.assertEqual(lf.pick_email(emails, "foo.co.uk"), "office@foo.co.uk")
-        self.assertEqual(lf.pick_email(["a@gmail.com"], "foo.co.uk"), "a@gmail.com")
-        self.assertEqual(lf.pick_email([], "foo.co.uk"), "")
-
-    def test_find_email_follows_contact_page(self):
-        pages = {
-            "http://foo.co.uk/": FakeResp('<a href="/contact-us">Contact</a>'),
-            "http://foo.co.uk/contact-us": FakeResp("Email us: hello@foo.co.uk"),
-        }
-        crawler = lf.SiteCrawler(FakeSession(pages))
-        with mock.patch("time.sleep"):
-            self.assertEqual(crawler.find_email("http://foo.co.uk/"), "hello@foo.co.uk")
-
-    def test_find_email_none_when_absent(self):
-        crawler = lf.SiteCrawler(FakeSession({"http://bar.co.uk/": FakeResp("phone 0113 000")}))
-        with mock.patch("time.sleep"):
-            self.assertEqual(crawler.find_email("http://bar.co.uk/"), "")
-
     def test_load_known_with_title_rows(self):
         values = [
             ["ES Agents - Outreach Tracker"] * 4,
@@ -128,20 +109,6 @@ class Tests(unittest.TestCase):
         picks, nxt = lf.pick_combos(cfg, 3, 3)
         self.assertEqual(len(picks), 3)
         self.assertEqual(nxt, (3 + 3) % 4)
-
-    def test_companies_house_match(self):
-        class S:
-            def get(_, *a, **k):
-                r = FakeResp()
-                r.status_code = 200
-                r.json = lambda: {"items": [
-                    {"title": "FOO PLUMBING LTD", "company_status": "active", "company_number": "123", "address_snippet": "York"},
-                    {"title": "FOO PLUMBING LTD", "company_status": "dissolved", "company_number": "9"},
-                ]}
-                return r
-        lead = lf.Lead("Foo Plumbing", "Plumber", "York")
-        with mock.patch("time.sleep"):
-            self.assertEqual(lf.companies_house_check(lead, S(), "k"), "Ltd (active) 123")
 
     def test_clean_secret_strips_bom_and_whitespace(self):
         self.assertEqual(lf.clean_secret("\ufeff \u200b abc\r\n"), "abc")
@@ -283,38 +250,6 @@ class Tests(unittest.TestCase):
             for pat in bad:
                 self.assertIsNone(re.search(pat, text), f"{rel} matches {pat}")
 
-    def test_crawl_emails_runs_sites_in_parallel_and_survives_errors(self):
-        import threading
-        leads = [lf.Lead(f"B{i}", "x", "y", f"http://site{i}.co.uk") for i in range(6)]
-        started, gate = set(), threading.Barrier(3, timeout=5)
-
-        class C:
-            def find_email(_, url):
-                if "site0" in url:
-                    raise ValueError("boom")
-                started.add(threading.get_ident())
-                if "site1" in url or "site2" in url or "site3" in url:
-                    gate.wait()  # only passes if three sites are being fetched at the same time
-                return "info@" + url.split("//")[1].rstrip("/")
-        with mock.patch.object(lf, "log"):
-            out = lf.crawl_emails(C(), leads, 4, time.monotonic() + 30)
-        self.assertEqual(len(out), 6)
-        self.assertEqual(out[id(leads[0])], "")  # the error became "no email"
-        self.assertEqual(out[id(leads[5])], "info@site5.co.uk")
-        self.assertGreaterEqual(len(started), 3)
-
-    def test_crawl_emails_stops_at_the_deadline(self):
-        leads = [lf.Lead("B", "x", "y", "http://slow.co.uk")]
-
-        class C:
-            def find_email(_, url):
-                time.sleep(1.5)
-                return "a@slow.co.uk"
-        with mock.patch.object(lf, "log") as lg:
-            out = lf.crawl_emails(C(), leads, 1, time.monotonic() + 0.2)
-        self.assertEqual(out, {})
-        self.assertTrue(any("budget used up" in c.args[0] for c in lg.call_args_list))
-
     def test_failed_searches_are_retried_first_next_run(self):
         cfg = {"trades": [{"label": "a"}, {"label": "b"}, {"label": "c"}], "towns": ["x", "y"]}
         state = {"cursor": 0, "retry": [["c", "y"], ["zzz", "gone"]]}
@@ -353,55 +288,363 @@ class Tests(unittest.TestCase):
             self.assertIn(flag, lf.key_shape(bad))
         self.assertNotIn("quotes=True", good)
 
-    def test_companies_house_uses_basic_auth_key_as_username(self):
-        seen = []
+    # ------------------------------------------------------------------ emails
+    def test_scan_page_reports_how_each_address_appeared(self):
+        cf_key = 0x42
+        cf_plain = "cf@foo.co.uk"
+        cf_hex = "%02x" % cf_key + "".join("%02x" % (ord(c) ^ cf_key) for c in cf_plain)
+        page = ('<a href="mailto:Info@Foo.co.uk?subject=hi">mail</a> <p>Call or write: sales@foo.co.uk</p>'
+                '<p>bob [at] foo [dot] co.uk</p>'
+                f'<a data-cfemail="{cf_hex}">[email protected]</a>'
+                '<script>var e = "hidden@foo.co.uk";</script><!-- old@foo.co.uk -->')
+        got = dict(lf.scan_page(page)[0])
+        self.assertEqual(got["info@foo.co.uk"], "mailto")
+        self.assertEqual(got["sales@foo.co.uk"], "text")
+        self.assertEqual(got["bob@foo.co.uk"], "obfuscated")
+        self.assertEqual(got[cf_plain], "cloudflare")
+        self.assertNotIn("hidden@foo.co.uk", got)  # scripts and comments are not page content
+        self.assertNotIn("old@foo.co.uk", got)
+
+    def test_junk_addresses_are_dropped_and_counted(self):
+        page = ("noreply@foo.co.uk no-reply@foo.co.uk do-not-reply@foo.co.uk abc@sentry.io x@o1.ingest.sentry.io "
+                "a1b2@wixpress.com someone@example.com logo@2x.png banner@site.jpg real@foo.co.uk")
+        found, junk = lf.scan_page(page)
+        self.assertEqual([e for e, _ in found], ["real@foo.co.uk"])
+        self.assertGreaterEqual(junk, 8)
+
+    def test_domain_helpers(self):
+        self.assertEqual(lf.registrable_domain("www.shop.foo.co.uk"), "foo.co.uk")
+        self.assertEqual(lf.registrable_domain("mail.foo.com"), "foo.com")
+        self.assertTrue(lf.email_matches_site("info@foo.co.uk", "www.foo.co.uk"))
+        self.assertTrue(lf.email_matches_site("a@mail.foo.co.uk", "foo.co.uk"))
+        self.assertFalse(lf.email_matches_site("hello@agency.co.uk", "foo.co.uk"))
+        self.assertFalse(lf.email_matches_site("a@foo.com", "foo.co.uk"))
+
+    def test_rank_emails_prefers_own_domain_then_freemail(self):
+        cands = [("z@agency.com", "s"), ("me@gmail.com", "s"), ("bob@foo.co.uk", "s"), ("info@foo.co.uk", "s")]
+        ranked = [e for e, _ in lf.rank_emails(cands, "foo.co.uk", set(lf.DEFAULT_FREEMAIL))]
+        self.assertEqual(ranked, ["info@foo.co.uk", "bob@foo.co.uk", "me@gmail.com", "z@agency.com"])
+
+    def test_mx_status(self):
+        import dns.exception
+        import dns.resolver
+
+        class Ans:
+            def __init__(self, host):
+                self.exchange = mock.Mock(to_text=lambda: host)
+        lf._mx_cache.clear()
+        with mock.patch.object(dns.resolver.Resolver, "resolve", return_value=[Ans("mx.foo.co.uk.")]):
+            self.assertEqual(lf.mx_status("foo.co.uk"), "ok")
+        with mock.patch.object(dns.resolver.Resolver, "resolve", return_value=[Ans(".")]):
+            self.assertEqual(lf.mx_status("nullmx.co.uk"), "none")  # a null MX means "does not accept mail"
+        with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=dns.resolver.NXDOMAIN()):
+            self.assertEqual(lf.mx_status("gone.co.uk"), "none")
+        with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=dns.resolver.NoAnswer()):
+            self.assertEqual(lf.mx_status("nomx.co.uk"), "none")
+        with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=dns.exception.Timeout()):
+            self.assertEqual(lf.mx_status("slow.co.uk"), "error")
+        lf._mx_cache.clear()
+
+    def _crawler(self, pages):
+        return lf.SiteCrawler(FakeSession(pages))
+
+    def test_collect_follows_a_linked_contact_page(self):
+        pages = {
+            "http://foo.co.uk/": FakeResp('<a href="/contact-us">Contact</a> made by web@agency.com'),
+            "http://foo.co.uk/contact-us": FakeResp('Email us: <a href="mailto:hello@foo.co.uk">here</a>'),
+        }
+        with mock.patch("time.sleep"):
+            found, junk, fetched = self._crawler(pages).collect(
+                "http://foo.co.uk/", lambda e: lf.email_matches_site(e, "foo.co.uk"))
+        self.assertTrue(fetched)
+        self.assertIn(("hello@foo.co.uk", "Website contact page /contact-us (mailto link)"), found)
+        self.assertIn(("web@agency.com", "Website homepage (visible text)"), found)
+
+    def test_collect_never_fetches_pages_that_are_not_linked(self):
+        asked = []
+
+        class S(FakeSession):
+            def get(self, url, **kw):
+                asked.append(url)
+                return super().get(url, **kw)
+        crawler = lf.SiteCrawler(S({"http://foo.co.uk/": FakeResp("no address here")}))
+        with mock.patch("time.sleep"):
+            found, _, fetched = crawler.collect("http://foo.co.uk/", lambda e: True)
+        self.assertEqual((found, fetched), ([], True))
+        self.assertFalse(any("contact" in u for u in asked))  # no guessed /contact or /contact-us
+
+    def test_collect_reports_an_unreachable_site(self):
+        with mock.patch("time.sleep"):
+            self.assertEqual(self._crawler({}).collect("http://down.co.uk/", lambda e: True), ([], 0, False))
+
+    def _resolve(self, page, website="http://foo.co.uk/", rules=None, mx="ok", osm=None):
+        crawler = self._crawler({website: FakeResp(page)} if page is not None else {})
+        lead = lf.Lead("Foo Plumbing", "Plumber", "York", website)
+        lead.osm_emails = osm or []
+        rules = rules or lf.EmailRules()
+        with mock.patch("time.sleep"), mock.patch.object(lf, "mx_status", return_value=mx):
+            return lf.resolve_email(crawler, lead, rules)
+
+    def test_resolve_accepts_own_domain_mailto_and_names_the_source(self):
+        email, source, reason = self._resolve('<a href="mailto:info@foo.co.uk">x</a>')
+        self.assertEqual((email, reason), ("info@foo.co.uk", ""))
+        self.assertEqual(source, "Website homepage (mailto link)")
+
+    def test_resolve_accepts_freemail_only_when_written_on_the_page(self):
+        email, _, reason = self._resolve("Write to foo.plumbing@gmail.com")
+        self.assertEqual((email, reason), ("foo.plumbing@gmail.com", ""))
+        self.assertEqual(self._resolve("Write to foo.plumbing@aol.com")[2], "third_party")  # not in the freemail list
+
+    def test_resolve_rejects_third_party_addresses(self):
+        self.assertEqual(self._resolve("Site by hello@webagency.co.uk")[::2], ("", "third_party"))
+
+    def test_resolve_rejects_domains_without_mx(self):
+        self.assertEqual(self._resolve("info@foo.co.uk", mx="none")[::2], ("", "no_mx"))
+        self.assertEqual(self._resolve("info@foo.co.uk", mx="error")[::2], ("", "mx_lookup_failed"))
+
+    def test_resolve_skips_freemail_mx_lookup(self):
+        with mock.patch.object(lf, "mx_status", side_effect=AssertionError("no lookup for gmail")):
+            crawler = self._crawler({"http://foo.co.uk/": FakeResp("a.b@gmail.com")})
+            with mock.patch("time.sleep"):
+                self.assertEqual(lf.resolve_email(crawler, lf.Lead("F", "x", "y", "http://foo.co.uk/"),
+                                                  lf.EmailRules())[0], "a.b@gmail.com")
+
+    def test_resolve_never_guesses_an_address(self):
+        email, source, reason = self._resolve("Ring us on 0113 496 0000")
+        self.assertEqual((email, source, reason), ("", "", "no_email_found"))
+        self.assertEqual(self._resolve(None)[2], "site_unavailable")
+        self.assertEqual(self._resolve("noreply@foo.co.uk logo@2x.png")[2], "junk_only")
+
+    def test_resolve_uses_openstreetmap_tag_and_labels_it(self):
+        email, source, reason = self._resolve("no address on the page", osm=["hello@foo.co.uk"])
+        self.assertEqual((email, source, reason), ("hello@foo.co.uk", "OpenStreetMap tag", ""))
+        # an OSM address is held to the same domain rule as everything else
+        self.assertEqual(self._resolve("nothing", osm=["x@webagency.co.uk"])[2], "third_party")
+
+    def test_resolve_suppression_and_duplicates(self):
+        rules = lf.EmailRules(suppressed_emails={"info@foo.co.uk"})
+        self.assertEqual(self._resolve("info@foo.co.uk", rules=rules)[2], "suppressed")
+        rules = lf.EmailRules(suppressed_domains={"foo.co.uk"})
+        self.assertEqual(self._resolve("sales@foo.co.uk", rules=rules)[2], "suppressed")  # whole domain
+        rules = lf.EmailRules(known_emails={"info@foo.co.uk"})
+        self.assertEqual(self._resolve("info@foo.co.uk", rules=rules)[2], "duplicate")
+        # bouncing one gmail address must not suppress every gmail address
+        rules = lf.EmailRules(suppressed_emails={"bad@gmail.com"}, suppressed_domains={"gmail.com"})
+        self.assertEqual(self._resolve("good@gmail.com", rules=rules)[::2], ("good@gmail.com", ""))
+        self.assertEqual(self._resolve("bad@gmail.com", rules=rules)[2], "suppressed")
+
+    def test_resolve_falls_back_to_a_second_address_that_passes(self):
+        page = "sales@foo.co.uk and info@foo.co.uk"
+        rules = lf.EmailRules(suppressed_emails={"info@foo.co.uk"})
+        self.assertEqual(self._resolve(page, rules=rules)[::2], ("sales@foo.co.uk", ""))
+
+    def test_load_suppression_reads_every_cell_of_both_tabs(self):
+        tabs = {
+            "Outreach Tracker": [["Business Name", "Email", "Status"], ["A", "Owner <a@foo.co.uk>", "Sent"]],
+            "Replies": [["When", "From", "Note"], ["today", "b@bar.co.uk", "unsubscribe; also c@gmail.com"]],
+        }
+        import gspread
+
+        class SH:
+            def worksheet(_, name):
+                if name not in tabs:
+                    raise gspread.WorksheetNotFound(name)
+                return FakeWS(tabs[name])
+        with mock.patch.object(lf, "log") as lg:
+            emails, domains = lf.load_suppression(SH(), ["Outreach Tracker", "Replies", "Missing"])
+        self.assertEqual(emails, {"a@foo.co.uk", "b@bar.co.uk", "c@gmail.com"})
+        self.assertEqual(domains, {"foo.co.uk", "bar.co.uk", "gmail.com"})
+        self.assertTrue(any("'Missing' not found" in c.args[0] for c in lg.call_args_list))
+
+    # ------------------------------------------------------------------ companies
+    def _cfg(self):
+        return lf.load_config()
+
+    def _info(self, **kw):
+        info = {"number": "01234567", "title": "FOO PLUMBING LTD", "status": "active", "type": "ltd",
+                "created": "2019-06-01", "accounts_type": "micro-entity", "sic": ["43220"], "profile": True}
+        info.update(kw)
+        return info
+
+    def _assess(self, **kw):
+        lead = lf.Lead(kw.pop("name", "Foo Plumbing"), kw.pop("trade", "Plumber"), "York")
+        return lf.assess_company(self._info(**kw), lead, self._cfg(), today=date(2026, 9, 21))
+
+    def test_a_small_established_matching_ltd_passes(self):
+        reasons, facts = self._assess()
+        self.assertEqual(reasons, [])
+        self.assertEqual(facts, "micro-entity accounts, active 7 yrs, SIC 43220 fits Plumber")
+        for good in ("small", "total-exemption-small", "total-exemption-full"):
+            self.assertEqual(self._assess(accounts_type=good)[0], [])
+
+    def test_company_rules_send_leads_to_review(self):
+        cases = [
+            (dict(accounts_type="full"), "accounts: full"),
+            (dict(accounts_type="group"), "accounts: group"),
+            (dict(accounts_type=None), "accounts: none filed"),
+            (dict(accounts_type="medium"), "accounts: medium"),
+            (dict(created="2025-06-01"), "incorporated under 2 yrs ago"),
+            (dict(created=None), "no incorporation date"),
+            (dict(sic=["56101"]), "SIC does not fit trade (56101)"),
+            (dict(sic=[]), "SIC does not fit trade"),
+            (dict(status="dissolved"), "status dissolved"),
+            (dict(type="plc"), "not a private Ltd (plc)"),
+            (dict(type="private-limited-guarant-nsc"), "not a private Ltd (private-limited-guarant-nsc)"),
+            (dict(profile=False), "company profile unavailable"),
+            (dict(title="FOO HOLDINGS LTD"), "name contains 'holdings'"),
+            (dict(title="FOO GROUP LTD"), "name contains 'group'"),
+            (dict(title="FOO PLC"), "name contains 'plc'"),
+            (dict(name="Foo Bank Plumbing"), "name contains 'bank'"),
+            (dict(title="CITY COUNCIL SERVICES LTD"), "name contains 'council'"),
+        ]
+        for kw, expected in cases:
+            reasons, _ = self._assess(**kw)
+            self.assertIn(expected, reasons, kw)
+
+    def test_no_companies_house_match_is_review(self):
+        lead = lf.Lead("Foo", "Plumber", "York")
+        self.assertEqual(lf.assess_company(None, lead, self._cfg())[0], ["not confirmed Ltd"])
+
+    def test_company_age_boundary(self):
+        self.assertEqual(self._assess(created="2024-09-21")[0], [])  # exactly two years
+        self.assertTrue(self._assess(created="2024-09-22")[0])
+
+    def test_every_trade_has_sic_prefixes(self):
+        for trade in self._cfg()["trades"]:
+            self.assertTrue(trade.get("sic"), trade["label"])
+
+    def test_companies_house_lookup_fetches_the_profile(self):
+        calls = []
 
         class S:
-            def get(_, *a, **k):
-                seen.append(k.get("auth"))
+            def get(_, url, **k):
+                calls.append((url.rsplit("/", 2)[-2] + "/" + url.rsplit("/", 1)[-1], k.get("auth")))
                 r = FakeResp()
                 r.status_code = 200
-                r.text = ""
-                r.json = lambda: {"items": []}
+                if url.endswith("/search/companies"):
+                    r.json = lambda: {"items": [
+                        {"title": "FOO PLUMBING LTD", "company_status": "dissolved", "company_number": "9"},
+                        {"title": "FOO PLUMBING LTD", "company_status": "active", "company_number": "123",
+                         "company_type": "ltd", "date_of_creation": "2019-06-01", "address_snippet": "York"}]}
+                else:
+                    r.json = lambda: {"company_status": "active", "type": "ltd", "date_of_creation": "2019-06-01",
+                                      "sic_codes": ["43220"], "accounts": {"last_accounts": {"type": "small"}}}
                 return r
-        with mock.patch("time.sleep"), mock.patch.object(lf, "log"):
-            lf.companies_house_self_test(S(), "thekey")
-            lf.companies_house_check(lf.Lead("Foo", "x", "y"), S(), "thekey")
-        self.assertEqual(seen, [("thekey", ""), ("thekey", "")])
-        prepared = lf.requests.Request("GET", "https://x", auth=("thekey", "")).prepare()
-        self.assertEqual(prepared.headers["Authorization"], "Basic dGhla2V5Og==")  # base64("thekey:")
+        with mock.patch("time.sleep"):
+            info = lf.companies_house_lookup(lf.Lead("Foo Plumbing", "Plumber", "York"), S(), "thekey")
+        self.assertEqual((info["number"], info["accounts_type"], info["sic"], info["profile"]),
+                         ("123", "small", ["43220"], True))
+        self.assertEqual([c[1] for c in calls], [("thekey", "")] * 2)  # Basic auth: key as username, empty password
+        self.assertEqual(lf.requests.Request("GET", "https://x", auth=("thekey", "")).prepare()
+                         .headers["Authorization"], "Basic dGhla2V5Og==")
 
-    def test_end_to_end_dry_run(self):
+    def test_lookup_without_a_match_returns_none(self):
+        class S:
+            def get(_, *a, **k):
+                r = FakeResp()
+                r.status_code = 200
+                r.json = lambda: {"items": [{"title": "OTHER LTD", "company_status": "active", "company_number": "1"}]}
+                return r
+        with mock.patch("time.sleep"):
+            self.assertIsNone(lf.companies_house_lookup(lf.Lead("Foo Plumbing", "Plumber", "York"), S(), "k"))
+
+    def test_only_a_clean_company_is_pending(self):
+        lead = lf.Lead("A", "Plumber", "York")
+        lead.company = "Ltd (active) 01234567"
+        self.assertEqual(lf.lead_status(lead, "key"), "Pending")
+        lead.review_reasons = ["accounts: full"]
+        self.assertEqual(lf.lead_status(lead, "key"), "Review - accounts: full")
+        other = lf.Lead("B", "Plumber", "York")
+        self.assertEqual(lf.lead_status(other, "key"), "Review - not confirmed Ltd")
+        self.assertEqual(lf.lead_status(lead, ""), "Review - no Companies House check")
+
+    def test_row_carries_email_source_and_why(self):
+        ws = FakeWS([["Business Name", "Status"], ["Foo", "Pending"]])
+        _, header = lf.prepare_queue_tab(ws)
+        self.assertIn("Email Source", header)
+        self.assertIn("Why", header)
+        lead = lf.Lead("Foo Plumbing", "Plumber", "York", "http://foo.co.uk")
+        lead.email, lead.email_source, lead.why = "info@foo.co.uk", "Website homepage (mailto link)", "small accounts"
+        row = lf.row_for(lead, header, "Pending")
+        self.assertEqual(row[header.index("Email Source")], "Website homepage (mailto link)")
+        self.assertEqual(row[header.index("Why")], "small accounts")
+
+    def test_osm_email_tags_are_read_and_merged(self):
+        trade = {"label": "Plumber", "osm": [["craft", "plumber"]]}
+        data = {"elements": [{"type": "node", "lat": 53.9, "lon": -1.1, "tags": {
+            "name": "Foo", "website": "http://foo.co.uk", "contact:email": "Hello@Foo.co.uk; not-an-email"}}]}
+        with mock.patch.object(lf, "overpass_query", return_value=data), mock.patch("time.sleep"):
+            leads = lf.overpass_leads(trade, "York", None)
+        self.assertEqual(leads[0].osm_emails, ["hello@foo.co.uk"])
+        other = lf.Lead("Foo", "Plumber", "York")
+        other.osm_emails = ["x@foo.co.uk"]
+        leads[0].merge(other)
+        self.assertEqual(leads[0].osm_emails, ["hello@foo.co.uk", "x@foo.co.uk"])
+
+    def test_crawl_emails_runs_sites_in_parallel_and_survives_errors(self):
+        import threading
+        leads = [lf.Lead(f"B{i}", "x", "y", f"http://site{i}.co.uk") for i in range(6)]
+        started, gate = set(), threading.Barrier(3, timeout=5)
+
+        def work(lead):
+            if "site0" in lead.website:
+                raise ValueError("boom")
+            started.add(threading.get_ident())
+            if any(s in lead.website for s in ("site1", "site2", "site3")):
+                gate.wait()  # only passes if three sites are being fetched at the same time
+            return ("info@" + lead.website.split("//")[1].rstrip("/"), "src", "")
+        with mock.patch.object(lf, "log"):
+            out = lf.crawl_emails(work, leads, 4, time.monotonic() + 30)
+        self.assertEqual(len(out), 6)
+        self.assertEqual(out[id(leads[0])], ("", "", "error"))  # the error became "no email"
+        self.assertEqual(out[id(leads[5])][0], "info@site5.co.uk")
+        self.assertGreaterEqual(len(started), 3)
+
+    def test_crawl_emails_stops_at_the_deadline(self):
+        leads = [lf.Lead("B", "x", "y", "http://slow.co.uk")]
+
+        def work(lead):
+            time.sleep(1.5)
+            return ("a@slow.co.uk", "src", "")
+        with mock.patch.object(lf, "log") as lg:
+            out = lf.crawl_emails(work, leads, 1, time.monotonic() + 0.2)
+        self.assertEqual(out, {})
+        self.assertTrue(any("budget used up" in c.args[0] for c in lg.call_args_list))
+
+    def _run_end_to_end(self, info):
         leads = [
             lf.Lead("Foo Plumbing Ltd", "Plumber", "York", "http://foo.co.uk", source="OpenStreetMap"),
             lf.Lead("Foo Plumbing Ltd", "Plumber", "York", "http://foo.co.uk", source="Google Maps"),
             lf.Lead("No Site Sparks", "Electrician", "York", "", source="OpenStreetMap"),
             lf.Lead("Social Only", "Cafe", "York", "https://facebook.com/x", source="OpenStreetMap"),
         ]
-        env = {"COMPANIES_HOUSE_API_KEY": "k"}
-        with mock.patch.dict(os.environ, env, clear=False), \
+        found = ([("info@foo.co.uk", "Website homepage (mailto link)")], 0, True)
+        with mock.patch.dict(os.environ, {"COMPANIES_HOUSE_API_KEY": "k"}, clear=False), \
                 mock.patch.object(lf, "overpass_leads", return_value=leads), \
-                mock.patch.object(lf.SiteCrawler, "find_email", return_value="info@foo.co.uk"), \
-                mock.patch.object(lf, "companies_house_check", return_value="Ltd (active) 123"), \
+                mock.patch.object(lf.SiteCrawler, "collect", return_value=found), \
+                mock.patch.object(lf, "mx_status", return_value="ok"), \
+                mock.patch.object(lf, "companies_house_lookup", return_value=info), \
                 mock.patch.object(lf, "companies_house_self_test", return_value=True), \
-                mock.patch.object(lf, "load_state", return_value={"cursor": 0}),                 mock.patch.object(lf, "log") as lg:
+                mock.patch.object(lf, "load_state", return_value={"cursor": 0}), \
+                mock.patch.object(lf, "log") as lg:
             os.environ.pop("SHEET_ID", None)
             os.environ.pop("GOOGLE_SERVICE_ACCOUNT_JSON", None)
             n = lf.run(True, 1, 10)
-        self.assertEqual(n, 1)  # merged duplicate, dropped no-site + social-only
-        logged = " | ".join(str(c.args[0]) for c in lg.call_args_list)
-        self.assertNotIn("info@foo.co.uk", logged)  # lead emails never reach the (possibly public) log
-        self.assertIn("[foo.co.uk]", logged)
+        return n, "\n".join(str(c.args[0]) for c in lg.call_args_list)
 
-    def test_only_confirmed_active_ltd_is_pending(self):
-        ltd = lf.Lead("A", "x", "y")
-        ltd.company = "Ltd (active) 01234567"
-        other = lf.Lead("B", "x", "y")
-        self.assertEqual(lf.lead_status(ltd, "key"), "Pending")
-        self.assertEqual(lf.lead_status(other, "key"), "Review - not confirmed Ltd")
-        other.company = "Not confirmed"
-        self.assertEqual(lf.lead_status(other, "key"), "Review - not confirmed Ltd")
-        self.assertEqual(lf.lead_status(ltd, ""), "Review - no Companies House check")  # key rejected/missing
+    def test_end_to_end_dry_run_pending(self):
+        n, logged = self._run_end_to_end(self._info())
+        self.assertEqual(n, 1)  # merged duplicate, dropped no-site + social-only
+        self.assertIn("[foo.co.uk] Pending", logged)
+        self.assertNotIn("info@foo.co.uk", logged)  # lead emails never reach the (possibly public) log
+        self.assertIn("skipped: no own website: 2", logged)
+        self.assertIn("accepted: Pending: 1", logged)
+
+    def test_end_to_end_dry_run_full_accounts_goes_to_review(self):
+        n, logged = self._run_end_to_end(self._info(accounts_type="full"))
+        self.assertEqual(n, 1)
+        self.assertIn("[foo.co.uk] Review - accounts: full", logged)
+        self.assertNotIn("] Pending", logged)
 
 
 if __name__ == "__main__":

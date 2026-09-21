@@ -18,10 +18,13 @@ Finds small UK businesses from several free sources, merges them, pulls a real e
 ## What it does with each business
 
 - Only keeps businesses that have their own website (social pages and directories are ignored).
-- Only uses an email that is literally written on that site (home page, then contact/about pages). Nothing is guessed. Sites whose robots.txt disallows crawling are skipped.
+- **Emails are never guessed.** An address is used only if it is written on the business's own site (a `mailto:` link or visible text on the home page, or a contact/about page linked from it) or in its OpenStreetMap tags. Sites whose robots.txt disallows crawling are skipped.
+- The address must be on the business's own domain, or a normal freemail address (list in `config.json`) written on the site. Agency, web-designer and directory addresses are rejected. The domain must have a real MX record. `noreply`, sentry, wixpress, example and image-filename lookalikes are dropped.
+- **Suppression.** Any address or domain found anywhere in the `Outreach Tracker` or `Replies` tabs (contacted, bounced, opted out) is never added. Freemail domains are only suppressed address by address.
 - Skips anything already in your `Outreach Tracker` or `Business Queue` tabs (by name, website and email).
-- Sets `Status` to `Pending` only for businesses confirmed as active limited companies. Everything else gets `Review - not confirmed Ltd` so your emailer task ignores it until you decide (sole traders and partnerships need consent under PECR). Set `PENDING_ONLY_IF_LTD` to `false` in the workflow to change this.
-- Adds missing columns (Website, Contact Email, Company Type, Source, Date Added) to the end of the Business Queue header. It never edits existing rows.
+- **Pending is strict.** Companies House must show an active private limited company, incorporated at least 2 years ago, filing micro-entity, small or total-exemption accounts, with a SIC code matching the trade (`sic` in `config.json`). Names containing plc, group, holdings, bank or council, and full/group/medium accounts, go to `Review - <reason>`, which your emailer task ignores (sole traders and partnerships need consent under PECR).
+- Each lead records where its email was found (`Email Source`) and a short `Why` note.
+- Adds missing columns (Website, Contact Email, Company Type, Source, Date Added, Email Source, Why) to the end of the Business Queue header. It never edits existing rows.
 
 ## Tuning
 

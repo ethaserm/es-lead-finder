@@ -27,10 +27,11 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from datetime import date
 from urllib import robotparser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 
@@ -68,6 +69,15 @@ JUNK_EMAIL_DOMAINS = (
 )
 JUNK_LOCAL_PARTS = {"noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemon"}
 FILE_EXT_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "css", "js", "woff", "woff2", "ico"}
+JUNK_MARKERS = ("sentry", "wixpress", "example", "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply")
+DEFAULT_FREEMAIL = ("gmail.com", "googlemail.com", "outlook.com", "outlook.co.uk", "hotmail.com",
+                    "hotmail.co.uk", "yahoo.com", "yahoo.co.uk")
+TWO_LEVEL_SUFFIXES = {"co.uk", "org.uk", "ltd.uk", "plc.uk", "me.uk", "net.uk", "sch.uk", "ac.uk", "gov.uk"}
+# Companies House last_accounts.type values that mean a small company
+GOOD_ACCOUNTS = {"micro-entity": "micro-entity", "small": "small",
+                 "total-exemption-small": "total-exemption", "total-exemption-full": "total-exemption"}
+DEFAULT_EXCLUDED_WORDS = ("plc", "group", "holdings", "holding", "bank", "council")
+MIN_COMPANY_AGE_YEARS = 2
 
 NAME_ALIASES = {"business name", "name", "business"}
 COLUMN_ALIASES = {
@@ -81,14 +91,16 @@ COLUMN_ALIASES = {
     "company": {"company type", "company status"},
     "phone": {"phone", "telephone"},
     "date": {"date added"},
+    "email_source": {"email source"},
+    "why": {"why"},
 }
 DEFAULT_HEADER = [
     "Business Name", "Trade / Business Type", "Area", "Website", "Contact Email",
-    "Company Type", "Status", "Source", "Date Added",
+    "Company Type", "Status", "Source", "Date Added", "Email Source", "Why",
 ]
 CANONICAL_HEADERS = {
     "website": "Website", "email": "Contact Email", "company": "Company Type",
-    "source": "Source", "date": "Date Added",
+    "source": "Source", "date": "Date Added", "email_source": "Email Source", "why": "Why",
 }
 
 
@@ -190,6 +202,10 @@ class Lead:
         self.sources = {source} if source else set()
         self.email = ""
         self.company = ""  # e.g. "Ltd (active) 01234567"
+        self.osm_emails = []  # addresses written in the OpenStreetMap tags
+        self.email_source = ""
+        self.why = ""
+        self.review_reasons = []  # why this lead is not Pending; empty means every check passed
 
     @property
     def key(self):
@@ -197,6 +213,7 @@ class Lead:
 
     def merge(self, other):
         self.sources |= other.sources
+        self.osm_emails += [e for e in other.osm_emails if e not in self.osm_emails]
         for attr in ("website", "phone", "address"):
             if not getattr(self, attr) and getattr(other, attr):
                 setattr(self, attr, getattr(other, attr))
@@ -275,7 +292,11 @@ def overpass_leads(trade, town, session):
         website = tags.get("website") or tags.get("contact:website") or ""
         phone = tags.get("phone") or tags.get("contact:phone") or ""
         addr = " ".join(filter(None, [tags.get("addr:street"), tags.get("addr:city"), tags.get("addr:postcode")]))
-        leads.append(Lead(name, trade["label"], label, website, phone, addr, "OpenStreetMap"))
+        lead = Lead(name, trade["label"], label, website, phone, addr, "OpenStreetMap")
+        tagged = tags.get("email") or tags.get("contact:email") or ""
+        lead.osm_emails = [e.strip().lower() for e in re.split(r"[;,]", tagged)
+                           if EMAIL_RE.fullmatch(e.strip())]
+        leads.append(lead)
     return leads
 
 
@@ -377,41 +398,123 @@ def companies_house_self_test(session, api_key):
     return None
 
 
-def companies_house_check(lead, session, api_key):
-    """Return e.g. 'Ltd (active) 01234567' if the lead matches an active company, else ''."""
+def _ch_get(session, api_key, path, params=None):
+    """GET one Companies House resource with polite pacing. Returns parsed JSON or None."""
     try:
-        resp = session.get(
-            "https://api.company-information.service.gov.uk/search/companies",
-            params={"q": lead.name, "items_per_page": 5},
-            auth=(api_key, ""), timeout=20,
-        )
+        resp = session.get("https://api.company-information.service.gov.uk" + path,
+                           params=params, auth=(api_key, ""), timeout=20)
     except requests.RequestException as exc:
-        log(f"    companies house error: {exc}")
-        return ""
+        log(f"    companies house error: {type(exc).__name__}")
+        return None
     time.sleep(0.6)  # stay under the API rate limit
     if resp.status_code == 429:
         log("    companies house rate limited; waiting 60s")
         time.sleep(60)
-        return ""
+        return None
     if resp.status_code != 200:
-        return ""
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def companies_house_lookup(lead, session, api_key):
+    """Find the business's active company and fetch its profile. Returns a dict, or None if no match."""
+    data = _ch_get(session, api_key, "/search/companies", {"q": lead.name, "items_per_page": 5})
+    if not data:
+        return None
     target = norm_name(lead.name)
     town = (lead.area or "").lower()
-    for item in resp.json().get("items", []):
+    for item in data.get("items", []):
         if item.get("company_status") != "active":
             continue
-        cand = norm_name(item.get("title", ""))
-        ratio = difflib.SequenceMatcher(None, target, cand).ratio()
+        ratio = difflib.SequenceMatcher(None, target, norm_name(item.get("title", ""))).ratio()
         addr = (item.get("address_snippet") or "").lower()
-        if ratio >= 0.92 or (ratio >= 0.8 and town and town in addr):
-            return f"Ltd (active) {item.get('company_number', '')}".strip()
-    return ""
+        if not (ratio >= 0.92 or (ratio >= 0.8 and town and town in addr)):
+            continue
+        info = {
+            "number": item.get("company_number", ""), "title": item.get("title", ""),
+            "status": item.get("company_status"), "type": item.get("company_type"),
+            "created": item.get("date_of_creation"), "accounts_type": None, "sic": [], "profile": False,
+        }
+        profile = _ch_get(session, api_key, f"/company/{info['number']}")
+        if profile:
+            last = (profile.get("accounts") or {}).get("last_accounts") or {}
+            info.update(
+                status=profile.get("company_status", info["status"]), type=profile.get("type", info["type"]),
+                created=profile.get("date_of_creation", info["created"]), accounts_type=last.get("type"),
+                sic=profile.get("sic_codes") or [], profile=True,
+            )
+        return info
+    return None
+
+
+def assess_company(info, lead, cfg, today=None):
+    """Decide whether a lead's company is a real, small, established Ltd.
+
+    Returns (reasons, facts): reasons is empty only when every check passes (the lead can be
+    Pending); otherwise it lists why the lead must be reviewed. facts is a short "why" note.
+    """
+    today = today or date.today()
+    if not info:
+        return ["not confirmed Ltd"], "no active Companies House match"
+    reasons, facts = [], []
+    if info.get("type") != "ltd":
+        reasons.append(f"not a private Ltd ({info.get('type') or 'unknown type'})")
+    if info.get("status") != "active":
+        reasons.append(f"status {info.get('status')}")
+    if not info.get("profile"):
+        reasons.append("company profile unavailable")
+
+    words = set(_words(info.get("title", ""))) | set(_words(lead.name))
+    hits = sorted(words & set(cfg.get("excluded_company_words", DEFAULT_EXCLUDED_WORDS)))
+    if hits:
+        reasons.append(f"name contains '{hits[0]}'")
+
+    try:
+        created = date.fromisoformat(info.get("created") or "")
+    except ValueError:
+        created = None
+    if created is None:
+        reasons.append("no incorporation date")
+    elif (today - created).days < MIN_COMPANY_AGE_YEARS * 365:
+        reasons.append(f"incorporated under {MIN_COMPANY_AGE_YEARS} yrs ago")
+    else:
+        facts.append(f"active {(today - created).days // 365} yrs")
+
+    acct = info.get("accounts_type")
+    if acct in GOOD_ACCOUNTS:
+        facts.insert(0, f"{GOOD_ACCOUNTS[acct]} accounts")
+    else:
+        reasons.append(f"accounts: {acct or 'none filed'}")
+
+    trade_sic = next((t.get("sic", []) for t in cfg.get("trades", []) if t["label"] == lead.trade), [])
+    match = next((c for c in info.get("sic", []) if any(str(c).startswith(p) for p in trade_sic)), None)
+    if match:
+        facts.append(f"SIC {match} fits {lead.trade}")
+    else:
+        reasons.append("SIC does not fit trade" + (f" ({', '.join(info['sic'][:2])})" if info.get("sic") else ""))
+    return reasons, ", ".join(facts) if not reasons else "; ".join(reasons)
 
 
 # --------------------------------------------------------------------------- email extraction
+# An address is only ever taken from text that is really on the page (a mailto link, visible
+# text, an obfuscated "name [at] domain" written out on the page, or Cloudflare's own encoding of
+# an address on the page) or from an OpenStreetMap tag. Nothing is constructed or guessed.
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
 CF_EMAIL_RE = re.compile(r'data-cfemail="([0-9a-fA-F]+)"')
 LINK_RE = re.compile(r'href=["\']([^"\'#]+)["\']', re.I)
+MAILTO_RE = re.compile(r'href=["\']mailto:([^"\'?>\s]+)', re.I)
+CODE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>|<!--.*?-->", re.I | re.S)
+TAG_RE = re.compile(r"<[^>]+>")
+KIND_LABEL = {
+    "mailto": "mailto link", "text": "visible text", "obfuscated": "obfuscated text on page",
+    "cloudflare": "Cloudflare-encoded address on page",
+}
+MX_UNKNOWN_REASON = "mx_lookup_failed"
+# rejection reasons, weakest to strongest: a lead reports the furthest one any of its addresses reached
+REJECT_ORDER = ["third_party", "duplicate", "suppressed", "mx_lookup_failed", "no_mx"]
 
 
 def decode_cf_email(hexstr):
@@ -422,43 +525,158 @@ def decode_cf_email(hexstr):
         return ""
 
 
-def extract_emails(page_html):
-    text = html.unescape(page_html)
-    text = re.sub(r"\s*[\[(]\s*at\s*[\])]\s*", "@", text, flags=re.I)
-    text = re.sub(r"\s*[\[(]\s*dot\s*[\])]\s*", ".", text, flags=re.I)
-    found = EMAIL_RE.findall(text)
+def is_junk_email(email):
+    local, _, domain = email.partition("@")
+    tld = domain.rsplit(".", 1)[-1]
+    return bool(
+        not local or not domain or len(email) > 80 or tld in FILE_EXT_TLDS
+        or local in JUNK_LOCAL_PARTS
+        or any(m in local or m in domain for m in JUNK_MARKERS)
+        or any(domain.endswith(j) for j in JUNK_EMAIL_DOMAINS)
+        or re.search(r"\d+x\d*$", local) or local.startswith("u00")
+    )
+
+
+def scan_page(page_html):
+    """Return ([(email, kind)], junk_count) for one page; kind says how it appeared on the page."""
+    body = CODE_RE.sub(" ", page_html)  # ignore scripts, styles and comments
+    found, junk = {}, set()
+
+    def add(raw, kind):
+        email = unquote(html.unescape(raw)).strip().strip(".").lower()
+        if not EMAIL_RE.fullmatch(email):
+            return
+        if is_junk_email(email):
+            junk.add(email)
+        else:
+            found.setdefault(email, kind)
+
+    for raw in MAILTO_RE.findall(body):
+        add(raw, "mailto")
+    text = html.unescape(TAG_RE.sub(" ", body))
+    for raw in EMAIL_RE.findall(text):
+        add(raw, "text")
+    spelled = re.sub(r"\s*[\[(]\s*at\s*[\])]\s*", "@", text, flags=re.I)
+    spelled = re.sub(r"\s*[\[(]\s*dot\s*[\])]\s*", ".", spelled, flags=re.I)
+    if spelled != text:
+        for raw in EMAIL_RE.findall(spelled):
+            add(raw, "obfuscated")
     for hexstr in CF_EMAIL_RE.findall(page_html):
         decoded = decode_cf_email(hexstr)
         if decoded:
-            found.append(decoded)
-    cleaned, seen = [], set()
-    for email in found:
-        email = email.strip(".").lower()
+            add(decoded, "cloudflare")
+    return list(found.items()), len(junk)
+
+
+def extract_emails(page_html):
+    return [email for email, _ in scan_page(page_html)[0]]
+
+
+def domain_of(email):
+    return email.rpartition("@")[2].lower()
+
+
+def registrable_domain(host):
+    parts = host.lower().strip(".").split(".")
+    if len(parts) >= 3 and ".".join(parts[-2:]) in TWO_LEVEL_SUFFIXES:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
+
+
+def email_matches_site(email, site_host):
+    return registrable_domain(domain_of(email)) == registrable_domain(site_host)
+
+
+def rank_emails(candidates, site_host, freemail):
+    """Order (email, source) pairs: the business's own domain first, then freemail, then by a
+    preference for generic mailboxes."""
+    prefixes = ("info", "hello", "enquiries", "contact", "office", "admin", "sales")
+
+    def key(item):
+        email = item[0]
+        own = 0 if email_matches_site(email, site_host) else (1 if domain_of(email) in freemail else 2)
+        local = email.partition("@")[0]
+        pref = prefixes.index(local) if local in prefixes else len(prefixes)
+        return own, pref
+
+    return sorted(candidates, key=key)  # sorted() is stable, so page order breaks ties
+
+
+_mx_cache = {}
+
+
+def mx_status(domain):
+    """'ok' if the domain has a real MX record, 'none' if it definitely has not, 'error' if DNS failed."""
+    domain = domain.lower().strip(".")
+    if domain in _mx_cache:
+        return _mx_cache[domain]
+    try:
+        import dns.exception
+        import dns.resolver
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = 6
+        resolver.timeout = 3
+        try:
+            answers = resolver.resolve(domain, "MX")
+            status = "ok" if any(r.exchange.to_text() != "." for r in answers) else "none"  # "." = null MX
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            status = "none"
+        except (dns.exception.DNSException, OSError):
+            status = "error"
+    except ImportError:
+        status = "error"
+    _mx_cache[domain] = status
+    return status
+
+
+class EmailRules:
+    """Read-only lists the email checks need. `known_emails` is shared with the caller on purpose."""
+
+    def __init__(self, freemail=DEFAULT_FREEMAIL, suppressed_emails=(), suppressed_domains=(), known_emails=()):
+        self.freemail = set(freemail)
+        self.suppressed_emails = set(suppressed_emails)
+        self.suppressed_domains = {registrable_domain(d) for d in suppressed_domains} - self.freemail  # never block all of gmail
+        self.known_emails = known_emails
+
+    def is_suppressed(self, email):
+        return email in self.suppressed_emails or registrable_domain(domain_of(email)) in self.suppressed_domains
+
+    def domain_suppressed(self, host):
+        return registrable_domain(host) in self.suppressed_domains
+
+
+def resolve_email(crawler, lead, rules):
+    """Find one deliverable, on-site email for a lead. Returns (email, source, reject_reason)."""
+    site_host = host_of(lead.website)
+
+    def domain_ok(email):
+        return domain_of(email) in rules.freemail or email_matches_site(email, site_host)
+
+    candidates = [(e, "OpenStreetMap tag") for e in lead.osm_emails if not is_junk_email(e)]
+    site_found, junk_seen, fetched = crawler.collect(lead.website, domain_ok)
+    candidates += site_found
+    if not candidates:
+        if junk_seen:
+            return "", "", "junk_only"
+        return "", "", "no_email_found" if fetched else "site_unavailable"
+    seen, reasons = set(), []
+    for email, source in rank_emails(candidates, site_host, rules.freemail):
         if email in seen:
             continue
-        local, _, domain = email.partition("@")
-        tld = domain.rsplit(".", 1)[-1]
-        if (not local or tld in FILE_EXT_TLDS or local in JUNK_LOCAL_PARTS
-                or len(email) > 80 or any(domain.endswith(j) for j in JUNK_EMAIL_DOMAINS)
-                or re.search(r"\d+x\d*$", local) or local.startswith("u00")):
-            continue
         seen.add(email)
-        cleaned.append(email)
-    return cleaned
-
-
-def pick_email(emails, site_host):
-    """Prefer an address on the business's own domain, else the first one found."""
-    base = site_host.split(".")
-    root = ".".join(base[-3:]) if site_host.endswith(".co.uk") else ".".join(base[-2:])
-    own = [e for e in emails if e.split("@")[1].endswith(root)]
-    if own:
-        for prefix in ("info", "hello", "enquiries", "contact", "office", "admin", "sales"):
-            for e in own:
-                if e.startswith(prefix + "@"):
-                    return e
-        return own[0]
-    return emails[0] if emails else ""
+        if not domain_ok(email):
+            reasons.append("third_party")
+        elif rules.is_suppressed(email):
+            reasons.append("suppressed")
+        elif email in rules.known_emails:
+            reasons.append("duplicate")
+        else:
+            domain = domain_of(email)
+            mx = "ok" if domain in rules.freemail else mx_status(domain)
+            if mx == "ok":
+                return email, source, ""
+            reasons.append("no_mx" if mx == "none" else MX_UNKNOWN_REASON)
+    return "", "", max(reasons, key=REJECT_ORDER.index)
 
 
 class SiteCrawler:
@@ -503,27 +721,38 @@ class SiteCrawler:
         except requests.RequestException:
             return ""
 
-    def find_email(self, website):
+    def collect(self, website, accept):
+        """Return ([(email, source)], junk_seen, fetched) from the homepage and, only while no
+        acceptable address has turned up, up to three contact/about pages linked from it."""
+        found, junk_total = [], 0
+
+        def take(page, label):
+            nonlocal junk_total
+            emails, junk = scan_page(page)
+            junk_total += junk
+            found.extend((e, f"Website {label} ({KIND_LABEL[kind]})") for e, kind in emails)
+
         home = self.get(website)
-        pages = [home] if home else []
-        emails = extract_emails(home) if home else []
-        if not emails and home:
-            host = urlparse(website).netloc
-            targets = []
+        if not home:
+            return [], 0, False
+        take(home, "homepage")
+        if not any(accept(e) for e, _ in found):
+            host, targets = host_of(website), []
             for href in LINK_RE.findall(home):
                 full = urljoin(website, href)
                 p = urlparse(full)
-                if p.netloc == host and re.search(r"contact|about", p.path, re.I) and full not in targets:
+                if (p.scheme in ("http", "https") and host_of(full) == host
+                        and re.search(r"contact|about", p.path, re.I) and full not in targets):
                     targets.append(full)
-            if not targets:
-                targets = [urljoin(website, "/contact"), urljoin(website, "/contact-us")]
             for url in targets[:3]:
                 page = self.get(url)
-                if page:
-                    emails = extract_emails(page)
-                    if emails:
-                        break
-        return pick_email(emails, host_of(website))
+                if not page:
+                    continue
+                path = urlparse(url).path or "/"
+                take(page, f"{'contact' if re.search('contact', path, re.I) else 'about'} page {path}")
+                if any(accept(e) for e, _ in found):
+                    break
+        return found, junk_total, True
 
 
 # --------------------------------------------------------------------------- Google Sheet
@@ -574,7 +803,7 @@ def prepare_queue_tab(ws):
         ws.update(range_name="A1", values=[DEFAULT_HEADER])
         return 0, list(DEFAULT_HEADER)
     header = list(values[h])
-    for key in ("website", "email", "company", "source", "date"):
+    for key in ("website", "email", "company", "source", "date", "email_source", "why"):
         if col_index(header, key) is None:
             header.append(CANONICAL_HEADERS[key])
             ws.update_cell(h + 1, len(header), CANONICAL_HEADERS[key])
@@ -592,6 +821,7 @@ def row_for(lead, header, status):
         "name": lead.name, "trade": lead.trade, "area": lead.area, "website": lead.website,
         "email": lead.email, "status": status, "source": "Lead Finder (" + " + ".join(sorted(lead.sources)) + ")",
         "company": lead.company or "Not confirmed", "phone": lead.phone, "date": date.today().strftime("%d/%m/%Y"),
+        "email_source": lead.email_source, "why": lead.why,
     }
     row = [""] * len(header)
     for key, val in values.items():
@@ -645,22 +875,22 @@ def pick_with_retries(cfg, state, count):
     return picks, next_cursor
 
 
-def crawl_emails(crawler, leads, workers, deadline):
-    """Find on-site emails for many sites at once. Returns {id(lead): email} for finished sites.
+def crawl_emails(work, leads, workers, deadline):
+    """Run `work(lead)` for many leads at once. Returns {id(lead): result} for those that finished.
 
     Sites are fetched in parallel, but SiteCrawler still waits 1s between hits to the same host
-    and honours robots.txt. Sites not finished by the deadline are dropped and found again later.
+    and honours robots.txt. Leads not finished by the deadline are dropped and found again later.
     """
-    def work(lead):
+    def safe(lead):
         try:
-            return crawler.find_email(lead.website)
+            return work(lead)
         except Exception as exc:  # one bad site must not stop the run
             log(f"    crawl error on {host_of(lead.website)}: {type(exc).__name__}")
-            return ""
+            return "", "", "error"
 
     results = {}
     pool = ThreadPoolExecutor(max_workers=max(1, workers))
-    futures = {pool.submit(work, lead): lead for lead in leads}
+    futures = {pool.submit(safe, lead): lead for lead in leads}
     try:
         for fut in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
             results[id(futures[fut])] = fut.result()
@@ -671,14 +901,32 @@ def crawl_emails(crawler, leads, workers, deadline):
     return results
 
 
-def lead_status(lead, ch_key, only_ltd=True):
-    """Pending only for a business confirmed as an active limited company by Companies House."""
-    confirmed = lead.company.startswith("Ltd")
-    if ch_key and (confirmed or not only_ltd):
+def lead_status(lead, ch_key):
+    """Pending only when Companies House confirms a small, established, active Ltd that fits the trade."""
+    if not ch_key:
+        return "Review - no Companies House check"
+    if lead.company.startswith("Ltd") and not lead.review_reasons:
         return "Pending"
-    if ch_key:
-        return "Review - not confirmed Ltd"
-    return "Review - no Companies House check"
+    return "Review - " + "; ".join(lead.review_reasons or ["not confirmed Ltd"])
+
+
+def load_suppression(sh, tabs):
+    """Every address written anywhere in the suppression tabs (contacted, bounced, opted out...)."""
+    import gspread
+    emails = set()
+    for tab in tabs:
+        try:
+            ws = sh.worksheet(tab)
+        except gspread.WorksheetNotFound:
+            log(f"  WARNING: suppression tab '{tab}' not found in the sheet")
+            continue
+        values = ws.get_all_values()
+        found = {e.lower() for row in values for cell in row for e in EMAIL_RE.findall(cell)}
+        h = find_header(values)
+        cols = [c for c in values[h] if c] if h is not None else "no header row detected"
+        log(f"  suppression from '{tab}': {len(values)} rows, {len(found)} addresses; columns: {cols}")
+        emails |= found
+    return emails, {domain_of(e) for e in emails}
 
 
 def next_retry_queue(failed, state):
@@ -697,9 +945,9 @@ def run(dry_run, combos_per_run, max_new):
     ch_key = clean_secret(os.environ.get("COMPANIES_HOUSE_API_KEY"))
     sheet_id = clean_secret(os.environ.get("SHEET_ID"))
     sa_json = clean_secret(os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"))
-    only_ltd = env_flag("PENDING_ONLY_IF_LTD", True)
     budget = GoogleBudget(env_int("GOOGLE_MAX_REQUESTS", 12))
     max_sites = env_int("MAX_SITES_PER_RUN", 120)
+    freemail = cfg.get("freemail_domains", DEFAULT_FREEMAIL)
 
     log(f"sources: OpenStreetMap=on, Google Places={'on' if google_key else 'off (no key)'}, "
         f"Companies House={'on' if ch_key else 'off (no key)'}")
@@ -711,12 +959,16 @@ def run(dry_run, combos_per_run, max_new):
 
     sh = ws = None
     known_names, known_emails, known_hosts = set(), set(), set()
+    suppressed_emails, suppressed_domains = set(), set()
     header = list(DEFAULT_HEADER)
     if sheet_id and sa_json:
         import gspread
         gc = gspread.service_account_from_dict(json.loads(sa_json))
         sh = gc.open_by_key(sheet_id)
+        log(f"tabs in the sheet: {[w.title for w in sh.worksheets()]}")
         known_names, known_emails, known_hosts = load_known(sh, [cfg["queue_tab"], cfg["tracker_tab"]])
+        suppressed_emails, suppressed_domains = load_suppression(
+            sh, cfg.get("suppression_tabs", [cfg["tracker_tab"], "Replies"]))
         if not dry_run:
             try:
                 ws = sh.worksheet(cfg["queue_tab"])
@@ -724,7 +976,7 @@ def run(dry_run, combos_per_run, max_new):
                 ws = sh.add_worksheet(cfg["queue_tab"], rows=1000, cols=12)
             _, header = prepare_queue_tab(ws)
     else:
-        log("no SHEET_ID / GOOGLE_SERVICE_ACCOUNT_JSON set - cannot de-duplicate against your sheet.")
+        log("no SHEET_ID / GOOGLE_SERVICE_ACCOUNT_JSON set - cannot de-duplicate or suppress against your sheet.")
         if not dry_run:
             sys.exit("Refusing to run without sheet credentials (use --dry-run to test).")
 
@@ -759,58 +1011,82 @@ def run(dry_run, combos_per_run, max_new):
     failed = next_retry_queue(failed, state)
     log(f"unique businesses this run: {len(pool)}")
 
+    rules = EmailRules(freemail, suppressed_emails, suppressed_domains, known_emails)
+    stats = Counter()
     chains = chain_keys(cfg)
-    candidates, skipped_chains = [], 0
+    candidates = []
     for lead in pool.values():
         if is_chain(lead, chains):
-            skipped_chains += 1
-            continue
-        if not lead.website:
-            continue
-        if norm_name(lead.name) in known_names or host_of(lead.website) in known_hosts:
-            continue
-        candidates.append(lead)
-    log(f"skipped national chains: {skipped_chains}")
-    log(f"with a website and not already contacted/queued: {len(candidates)}")
+            stats["skipped: national chain"] += 1
+        elif not lead.website:
+            stats["skipped: no own website"] += 1
+        elif norm_name(lead.name) in known_names or host_of(lead.website) in known_hosts:
+            stats["skipped: already in the sheet"] += 1
+        elif rules.domain_suppressed(host_of(lead.website)):
+            stats["skipped: domain suppressed (contacted/bounced/opted out)"] += 1
+        else:
+            candidates.append(lead)
+    log(f"with a website and not already contacted/queued/suppressed: {len(candidates)}")
 
     crawler = SiteCrawler(session)
-    found_emails = crawl_emails(crawler, candidates[:max_sites], env_int("CRAWL_WORKERS", 8), run_deadline)
-    crawled = len(found_emails)
+    results = crawl_emails(lambda lead: resolve_email(crawler, lead, rules),
+                           candidates[:max_sites], env_int("CRAWL_WORKERS", 8), run_deadline)
+    crawled = len(results)
+    stats["not crawled (time or site cap)"] += len(candidates) - crawled
     new_leads = []
     for lead in candidates:
         if len(new_leads) >= max_new:
             break
-        email = found_emails.get(id(lead), "")
-        if not email or email in known_emails:
+        if id(lead) not in results:
+            continue
+        email, source, reason = results[id(lead)]
+        if not email:
+            stats[f"email rejected: {reason}"] += 1
+            continue
+        if email in known_emails:  # another lead in this run already claimed it
+            stats["email rejected: duplicate"] += 1
             continue
         if ch_key and time.monotonic() >= run_deadline + CH_GRACE_SECONDS:
             log("out of time for Companies House checks; remaining leads left for a later run")
             break
-        lead.email = email
+        lead.email, lead.email_source = email, source
         known_emails.add(email)
         if ch_key:
-            lead.company = companies_house_check(lead, session, ch_key)
+            info = companies_house_lookup(lead, session, ch_key)
+            if info and info.get("type") == "ltd" and info.get("status") == "active":
+                lead.company = f"Ltd (active) {info['number']}"
+            lead.review_reasons, note = assess_company(info, lead, cfg)
+        else:
+            note = "Companies House not checked"
+        own = email_matches_site(email, host_of(lead.website))
+        lead.why = f"{note}; {'own-domain' if own else 'freemail'} email, MX ok"
         new_leads.append(lead)
+        status = lead_status(lead, ch_key)
+        stats["accepted: Pending" if status == "Pending" else f"accepted but Review: {status[9:]}"] += 1
         # emails stay out of the log: Actions logs can be public
-        log(f"  + {lead.name} [{host_of(lead.website)}] {lead.company or '(not confirmed Ltd)'}")
+        log(f"  + {lead.name} [{host_of(lead.website)}] {status}")
 
     rows, preview = [], []
     for lead in new_leads:
-        status = lead_status(lead, ch_key, only_ltd)
+        status = lead_status(lead, ch_key)
         rows.append(row_for(lead, header, status))
-        preview.append([lead.name, lead.trade, lead.area, lead.website, lead.email,
-                        lead.company or "Not confirmed", status, ", ".join(sorted(lead.sources))])
+        preview.append([lead.name, lead.trade, lead.area, lead.website, lead.email, lead.email_source,
+                        lead.company or "Not confirmed", status, lead.why, ", ".join(sorted(lead.sources))])
 
     os.makedirs(os.path.join(HERE, "output"), exist_ok=True)
     out_path = os.path.join(HERE, "output", f"leads_{date.today().isoformat()}.csv")
     with open(out_path, "a", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         if fh.tell() == 0:
-            writer.writerow(["Business Name", "Trade", "Area", "Website", "Email", "Company", "Status", "Sources"])
+            writer.writerow(["Business Name", "Trade", "Area", "Website", "Email", "Email source",
+                             "Company", "Status", "Why", "Sources"])
         writer.writerows(preview)
 
-    pending = sum(1 for r in preview if r[6] == "Pending")
-    log(f"new leads with a real on-site email: {len(rows)} (Pending: {pending}); crawled {crawled} sites; "
+    log("filter results:")
+    for key in sorted(stats):
+        log(f"  {key}: {stats[key]}")
+    pending = sum(1 for r in preview if r[7] == "Pending")
+    log(f"new leads with a deliverable on-site email: {len(rows)} (Pending: {pending}); crawled {crawled} sites; "
         f"google requests used: {budget.used}")
     if rows and ws is not None and not dry_run:
         ws.append_rows(rows, value_input_option="RAW")

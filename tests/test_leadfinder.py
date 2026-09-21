@@ -183,15 +183,21 @@ class Tests(unittest.TestCase):
             self.assertIsNone(lf.overpass_query("q", S()))
 
     def test_ch_self_test_statuses(self):
-        def sess(code):
+        def sess(code, text=""):
             class S:
                 def get(_, *a, **k):
                     r = FakeResp()
                     r.status_code = code
+                    r.text = text
                     return r
             return S()
         self.assertTrue(lf.companies_house_self_test(sess(200), "k"))
         self.assertFalse(lf.companies_house_self_test(sess(401), "k"))
+        self.assertFalse(lf.companies_house_self_test(sess(400), "k"))
+        with mock.patch.object(lf, "log") as lg:
+            lf.companies_house_self_test(sess(400, "bad SECRETKEY here"), "SECRETKEY")
+        self.assertNotIn("SECRETKEY", lg.call_args.args[0])
+        self.assertIn("bad *** here", lg.call_args.args[0])
         self.assertIsNone(lf.companies_house_self_test(sess(500), "k"))
 
     def test_end_to_end_dry_run(self):

@@ -46,12 +46,23 @@ jobs:
         run: python leadfinder.py
 
       - name: Upload preview CSV
+        id: upload
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: lead-preview
           path: output/*.csv
           if-no-files-found: ignore
+
+      - name: Upload preview CSV (retry)
+        if: always() && steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lead-preview
+          path: output/*.csv
+          if-no-files-found: ignore
+          overwrite: true
 
       - name: Save rotation state
         run: |

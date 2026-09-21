@@ -329,7 +329,7 @@ def google_leads(trade, town, session, api_key, budget, pages=1):
 def companies_house_self_test(session, api_key):
     """Search 'Tesco' and log only the HTTP status and whether the key was accepted.
 
-    Returns True (accepted), False (rejected: 401/403) or None (inconclusive).
+    Returns True (accepted), False (rejected: 400/401/403) or None (inconclusive).
     """
     try:
         resp = session.get(
@@ -343,10 +343,11 @@ def companies_house_self_test(session, api_key):
     if resp.status_code == 200:
         log("companies house self-test: HTTP 200, key accepted")
         return True
-    if resp.status_code in (401, 403):
-        log(f"companies house self-test: HTTP {resp.status_code}, key REJECTED")
+    body = (resp.text or "").replace(api_key, "***").replace("\n", " ")[:200]
+    if resp.status_code in (400, 401, 403):
+        log(f"companies house self-test: HTTP {resp.status_code}, key REJECTED; body: {body}")
         return False
-    log(f"companies house self-test: HTTP {resp.status_code}, inconclusive")
+    log(f"companies house self-test: HTTP {resp.status_code}, inconclusive; body: {body}")
     return None
 
 

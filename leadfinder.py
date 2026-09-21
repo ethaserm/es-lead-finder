@@ -40,8 +40,14 @@ UK_BBOX = (49.8, -8.7, 60.9, 1.8)  # south, west, north, east
 
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
+OVERPASS_ATTEMPTS = 5
+OVERPASS_BACKOFF_BASE = 5     # seconds; doubles each retry, capped below
+OVERPASS_BACKOFF_CAP = 60
+OVERPASS_QUERY_DELAY = 6      # polite pause after every query
+_overpass_next = 0
 
 BLOCKED_SITE_HOSTS = (
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
@@ -130,6 +136,37 @@ def clean_site(url):
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
 
 
+def clean_secret(value):
+    """Strip whitespace and any BOM/zero-width marker from a secret."""
+    return (value or "").replace("﻿", "").replace("​", "").strip()
+
+
+def _words(text):
+    return re.findall(r"[a-z0-9]+", html.unescape(text or "").lower().replace("&", " and "))
+
+
+def chain_keys(cfg):
+    """Each chain becomes (word list, joined string); matching is whole-word, not substring."""
+    keys = []
+    for chain in cfg.get("excluded_chains", []):
+        words = [w for w in _words(chain) if w not in NAME_STOPWORDS]
+        if words:
+            keys.append((words, "".join(words)))
+    return keys
+
+
+def is_chain(lead, keys):
+    name_words = [w for w in _words(lead.name) if w not in NAME_STOPWORDS]
+    host = re.sub(r"[^a-z0-9]", "", host_of(lead.website))
+    for words, joined in keys:
+        n = len(words)
+        if any(name_words[i:i + n] == words for i in range(len(name_words) - n + 1)):
+            return True
+        if len(joined) >= 6 and joined in host:
+            return True
+    return False
+
+
 def in_uk(lat, lon):
     if lat is None or lon is None:
         return True  # cannot tell; keep
@@ -160,6 +197,40 @@ class Lead:
 
 
 # --------------------------------------------------------------------------- source 1: OpenStreetMap
+def overpass_query(query, session):
+    """POST a query, rotating mirrors and backing off exponentially on 429/5xx/timeouts."""
+    global _overpass_next
+    for attempt in range(OVERPASS_ATTEMPTS):
+        url = OVERPASS_URLS[_overpass_next % len(OVERPASS_URLS)]
+        host = host_of(url)
+        retry = False
+        try:
+            resp = session.post(url, data={"data": query}, headers={"User-Agent": UA}, timeout=(10, 90))
+        except requests.RequestException as exc:
+            log(f"    overpass {host} error: {type(exc).__name__}")
+            retry = True
+        else:
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except ValueError:
+                    log(f"    overpass {host} returned invalid JSON")
+                    retry = True
+            elif resp.status_code in (429, 406, 500, 502, 503, 504):
+                log(f"    overpass {host} returned {resp.status_code}")
+                retry = True
+            else:
+                log(f"    overpass {host} returned {resp.status_code}")
+                retry = True  # try another mirror rather than give up
+        _overpass_next += 1  # next attempt goes to the next mirror
+        if retry and attempt < OVERPASS_ATTEMPTS - 1:
+            wait = min(OVERPASS_BACKOFF_BASE * 2 ** attempt, OVERPASS_BACKOFF_CAP)
+            log(f"    retrying on {host_of(OVERPASS_URLS[_overpass_next % len(OVERPASS_URLS)])} in {wait}s")
+            time.sleep(wait)
+    log("    overpass: giving up on this query after all retries")
+    return None
+
+
 def overpass_leads(trade, town, session):
     filters = "".join(
         f'nwr["{k}"="{v}"](area.a);' for k, v in trade.get("osm", [])
@@ -171,27 +242,8 @@ def overpass_leads(trade, town, session):
         f'[out:json][timeout:60];area["name"="{area_name}"]["boundary"="administrative"]->.a;'
         f"({filters});out center tags;"
     )
-    data = None
-    for url in OVERPASS_URLS:
-        try:
-            resp = session.post(url, data={"data": query}, headers={"User-Agent": UA}, timeout=90)
-        except requests.RequestException as exc:
-            log(f"    overpass {url} error: {exc}")
-            time.sleep(5)
-            continue
-        if resp.status_code in (429, 406, 504):
-            log(f"    overpass {url} returned {resp.status_code}; waiting 30s")
-            time.sleep(30)
-            continue
-        if resp.status_code != 200:
-            log(f"    overpass {url} returned {resp.status_code}")
-            continue
-        try:
-            data = resp.json()
-        except ValueError:
-            continue
-        break
-    time.sleep(6)  # stay well inside the public server's fair-use limits
+    data = overpass_query(query, session)
+    time.sleep(OVERPASS_QUERY_DELAY)  # stay well inside the public servers' fair-use limits
     if not data:
         return []
     label = town["name"] if isinstance(town, dict) else town
@@ -274,6 +326,30 @@ def google_leads(trade, town, session, api_key, budget, pages=1):
 
 
 # --------------------------------------------------------------------------- source 3: Companies House
+def companies_house_self_test(session, api_key):
+    """Search 'Tesco' and log only the HTTP status and whether the key was accepted.
+
+    Returns True (accepted), False (rejected: 401/403) or None (inconclusive).
+    """
+    try:
+        resp = session.get(
+            "https://api.company-information.service.gov.uk/search/companies",
+            params={"q": "Tesco", "items_per_page": 1},
+            auth=(api_key, ""), timeout=20,
+        )
+    except requests.RequestException as exc:
+        log(f"companies house self-test: request failed ({type(exc).__name__}); inconclusive")
+        return None
+    if resp.status_code == 200:
+        log("companies house self-test: HTTP 200, key accepted")
+        return True
+    if resp.status_code in (401, 403):
+        log(f"companies house self-test: HTTP {resp.status_code}, key REJECTED")
+        return False
+    log(f"companies house self-test: HTTP {resp.status_code}, inconclusive")
+    return None
+
+
 def companies_house_check(lead, session, api_key):
     """Return e.g. 'Ltd (active) 01234567' if the lead matches an active company, else ''."""
     try:
@@ -526,18 +602,21 @@ def pick_combos(cfg, cursor, count):
 def run(dry_run, combos_per_run, max_new):
     cfg = load_config()
     session = requests.Session()
-    google_key = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
-    ch_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
-    sheet_id = os.environ.get("SHEET_ID", "").strip()
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    google_key = clean_secret(os.environ.get("GOOGLE_PLACES_API_KEY"))
+    ch_key = clean_secret(os.environ.get("COMPANIES_HOUSE_API_KEY"))
+    sheet_id = clean_secret(os.environ.get("SHEET_ID"))
+    sa_json = clean_secret(os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"))
     only_ltd = env_flag("PENDING_ONLY_IF_LTD", True)
     budget = GoogleBudget(env_int("GOOGLE_MAX_REQUESTS", 12))
     max_sites = env_int("MAX_SITES_PER_RUN", 120)
 
     log(f"sources: OpenStreetMap=on, Google Places={'on' if google_key else 'off (no key)'}, "
         f"Companies House={'on' if ch_key else 'off (no key)'}")
+    if ch_key and companies_house_self_test(session, ch_key) is False:
+        log("WARNING: Companies House key rejected - disabling the check for this run.")
+        ch_key = ""
     if not ch_key:
-        log("WARNING: no Companies House key - every lead will be marked 'Review', none 'Pending'.")
+        log("WARNING: no usable Companies House key - every lead will be marked 'Review', none 'Pending'.")
 
     sh = ws = None
     known_names, known_emails, known_hosts = set(), set(), set()
@@ -580,13 +659,18 @@ def run(dry_run, combos_per_run, max_new):
                 pool[lead.key] = lead
     log(f"unique businesses this run: {len(pool)}")
 
-    candidates = []
+    chains = chain_keys(cfg)
+    candidates, skipped_chains = [], 0
     for lead in pool.values():
+        if is_chain(lead, chains):
+            skipped_chains += 1
+            continue
         if not lead.website:
             continue
         if norm_name(lead.name) in known_names or host_of(lead.website) in known_hosts:
             continue
         candidates.append(lead)
+    log(f"skipped national chains: {skipped_chains}")
     log(f"with a website and not already contacted/queued: {len(candidates)}")
 
     crawler = SiteCrawler(session)

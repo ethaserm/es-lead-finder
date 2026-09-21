@@ -1,6 +1,15 @@
 {
   "queue_tab": "Business Queue",
   "tracker_tab": "Outreach Tracker",
+  "excluded_chains": [
+    "Wolseley", "Screwfix", "Toolstation", "Travis Perkins", "Jewson", "Checkatrade",
+    "Rentokil", "B&Q", "Wickes", "Homebase", "Selco", "Plumb Center", "Howdens",
+    "Halfords", "Kwik Fit", "National Tyres", "Timpson", "Specsavers", "Greggs",
+    "Costa", "Starbucks", "Caffe Nero", "Pret A Manger", "Pets at Home", "Medivet",
+    "CVS Group", "Vets4Pets", "British Gas", "Homeserve", "Pimlico Plumbers",
+    "Rentokil Initial", "Anticimex", "Mitie", "Iceland", "Tesco", "Sainsbury",
+    "Morrisons", "Asda", "Co-op", "Boots", "Superdrug", "Sports Direct"
+  ],
   "trades": [
     {"label": "Electrician", "osm": [["craft", "electrician"]], "places": "electricians"},
     {"label": "Plumber", "osm": [["craft", "plumber"]], "places": "plumbers"},

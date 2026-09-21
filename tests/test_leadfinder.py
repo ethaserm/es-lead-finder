@@ -141,6 +141,59 @@ class Tests(unittest.TestCase):
         with mock.patch("time.sleep"):
             self.assertEqual(lf.companies_house_check(lead, S(), "k"), "Ltd (active) 123")
 
+    def test_clean_secret_strips_bom_and_whitespace(self):
+        self.assertEqual(lf.clean_secret("﻿ abc\r\n"), "abc")
+        self.assertEqual(lf.clean_secret(None), "")
+
+    def test_chain_exclusion(self):
+        keys = lf.chain_keys({"excluded_chains": ["Travis Perkins", "B&Q", "Screwfix"]})
+        self.assertTrue(lf.is_chain(lf.Lead("Travis Perkins Plc", "x", "y"), keys))
+        self.assertTrue(lf.is_chain(lf.Lead("Local Shop", "x", "y", "https://www.screwfix.com/x"), keys))
+        self.assertFalse(lf.is_chain(lf.Lead("Foo Plumbing", "x", "y", "http://foo.co.uk"), keys))
+        keys2 = lf.chain_keys({"excluded_chains": ["Co-op", "Costa"]})
+        self.assertTrue(lf.is_chain(lf.Lead("Co-op Food", "x", "y"), keys2))
+        self.assertFalse(lf.is_chain(lf.Lead("Cooper Electrical", "x", "y"), keys2))
+        self.assertFalse(lf.is_chain(lf.Lead("Costanza Plumbing", "x", "y"), keys2))
+
+    def test_overpass_retries_and_rotates_mirrors(self):
+        calls = []
+
+        class S:
+            def post(_, url, **k):
+                calls.append(url)
+                r = FakeResp()
+                if len(calls) < 3:
+                    r.status_code = 429
+                else:
+                    r.status_code = 200
+                    r.json = lambda: {"elements": []}
+                return r
+        with mock.patch("time.sleep") as sl:
+            data = lf.overpass_query("q", S())
+        self.assertEqual(data, {"elements": []})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(set(calls)), 3)  # each attempt hit a different mirror
+        self.assertEqual([c.args[0] for c in sl.call_args_list], [5, 10])  # exponential backoff
+
+    def test_overpass_gives_up_after_all_attempts(self):
+        class S:
+            def post(_, url, **k):
+                raise lf.requests.ConnectionError("x")
+        with mock.patch("time.sleep"):
+            self.assertIsNone(lf.overpass_query("q", S()))
+
+    def test_ch_self_test_statuses(self):
+        def sess(code):
+            class S:
+                def get(_, *a, **k):
+                    r = FakeResp()
+                    r.status_code = code
+                    return r
+            return S()
+        self.assertTrue(lf.companies_house_self_test(sess(200), "k"))
+        self.assertFalse(lf.companies_house_self_test(sess(401), "k"))
+        self.assertIsNone(lf.companies_house_self_test(sess(500), "k"))
+
     def test_end_to_end_dry_run(self):
         leads = [
             lf.Lead("Foo Plumbing Ltd", "Plumber", "York", "http://foo.co.uk", source="OpenStreetMap"),
@@ -153,6 +206,7 @@ class Tests(unittest.TestCase):
                 mock.patch.object(lf, "overpass_leads", return_value=leads), \
                 mock.patch.object(lf.SiteCrawler, "find_email", return_value="info@foo.co.uk"), \
                 mock.patch.object(lf, "companies_house_check", return_value="Ltd (active) 123"), \
+                mock.patch.object(lf, "companies_house_self_test", return_value=True), \
                 mock.patch.object(lf, "load_state", return_value={"cursor": 0}):
             os.environ.pop("SHEET_ID", None)
             os.environ.pop("GOOGLE_SERVICE_ACCOUNT_JSON", None)

@@ -905,9 +905,9 @@ def lead_status(lead, ch_key):
     """Pending only when Companies House confirms a small, established, active Ltd that fits the trade."""
     if not ch_key:
         return "Review - no Companies House check"
-    if lead.company.startswith("Ltd") and not lead.review_reasons:
+    if not lead.review_reasons:
         return "Pending"
-    return "Review - " + "; ".join(lead.review_reasons or ["not confirmed Ltd"])
+    return "Review - " + "; ".join(lead.review_reasons)
 
 
 def load_suppression(sh, tabs):

@@ -457,7 +457,7 @@ def assess_company(info, lead, cfg, today=None):
     Pending); otherwise it lists why the lead must be reviewed. facts is a short "why" note.
     """
     today = today or date.today()
-  if not info:
+    if not info:
         return [], "no active Companies House match (sole trader / unregistered — allowed)"
     reasons, facts = [], []
     if info.get("type") != "ltd":

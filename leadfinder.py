@@ -47,14 +47,17 @@ OVERPASS_URLS = [
 ]
 OVERPASS_ATTEMPTS = 3         # first try + at most 2 retries
 OVERPASS_BACKOFF_BASE = 2     # seconds; doubles each retry, capped below
-OVERPASS_BACKOFF_CAP = 10
+OVERPASS_BACKOFF_CAP = 6
 OVERPASS_QUERY_DELAY = 4      # polite pause after every query
-OVERPASS_REQUEST_TIMEOUT = (5, 25)  # connect, read: cap each attempt at ~25s
+OVERPASS_REQUEST_TIMEOUT = (5, 15)  # connect, read: cap each attempt at ~15s
 OVERPASS_SERVER_TIMEOUT = 20  # seconds the Overpass server may spend on a query
+OVERPASS_DEAD_THRESHOLD = 2   # times a mirror may fail before we stop trying it this run
 CH_GRACE_SECONDS = 90         # extra time after the crawl budget for Companies House checks
 PLACE_RADIUS_M = 3000        # search radius around a town's place node when it has no boundary
 _overpass_next = 0
 _overpass_deadline = None     # time.monotonic() after which Overpass searches are skipped
+_overpass_dead = set()        # hosts that failed OVERPASS_DEAD_THRESHOLD times this run
+_overpass_fail_counts = {}    # host -> failure count this run
 
 BLOCKED_SITE_HOSTS = (
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
@@ -221,13 +224,23 @@ class Lead:
 
 # --------------------------------------------------------------------------- source 1: OpenStreetMap
 def overpass_query(query, session):
-    """POST a query, rotating mirrors and backing off exponentially on 429/5xx/timeouts."""
+    """POST a query, rotating mirrors and backing off exponentially on 429/5xx/timeouts.
+
+    A mirror that fails OVERPASS_DEAD_THRESHOLD times in this run is treated as down and
+    skipped for the rest of the run, so later searches don't keep paying its full timeout
+    for nothing once we already know it's unreachable today.
+    """
     global _overpass_next
-    for attempt in range(OVERPASS_ATTEMPTS):
+    live = [u for u in OVERPASS_URLS if host_of(u) not in _overpass_dead]
+    if not live:
+        log("    overpass: all mirrors down this run; skipping")
+        return None
+    attempts = min(OVERPASS_ATTEMPTS, len(live))
+    for attempt in range(attempts):
         if _overpass_deadline is not None and time.monotonic() >= _overpass_deadline:
             log("    overpass time budget used up; skipping")
             return None
-        url = OVERPASS_URLS[_overpass_next % len(OVERPASS_URLS)]
+        url = live[_overpass_next % len(live)]
         host = host_of(url)
         retry = False
         try:
@@ -249,10 +262,18 @@ def overpass_query(query, session):
             else:
                 log(f"    overpass {host} returned {resp.status_code}")
                 retry = True  # try another mirror rather than give up
+        if retry:
+            _overpass_fail_counts[host] = _overpass_fail_counts.get(host, 0) + 1
+            if _overpass_fail_counts[host] >= OVERPASS_DEAD_THRESHOLD and host not in _overpass_dead:
+                _overpass_dead.add(host)
+                log(f"    overpass {host}: marking down for the rest of this run")
         _overpass_next += 1  # next attempt goes to the next mirror
-        if retry and attempt < OVERPASS_ATTEMPTS - 1:
+        if retry and attempt < attempts - 1:
+            live = [u for u in OVERPASS_URLS if host_of(u) not in _overpass_dead]
+            if not live:
+                break
             wait = min(OVERPASS_BACKOFF_BASE * 2 ** attempt, OVERPASS_BACKOFF_CAP)
-            log(f"    retrying on {host_of(OVERPASS_URLS[_overpass_next % len(OVERPASS_URLS)])} in {wait}s")
+            log(f"    retrying on {host_of(live[_overpass_next % len(live)])} in {wait}s")
             time.sleep(wait)
     log("    overpass: giving up on this query after all retries")
     return None
@@ -493,8 +514,13 @@ def assess_company(info, lead, cfg, today=None):
     match = next((c for c in info.get("sic", []) if any(str(c).startswith(p) for p in trade_sic)), None)
     if match:
         facts.append(f"SIC {match} fits {lead.trade}")
+    elif info.get("sic"):
+        # A SIC mismatch is a relevance signal (does Companies House's own classification match
+        # the trade we found it under), not a compliance risk like the checks above -- plenty of
+        # real small businesses file under a generic or unrelated SIC code. Note it, don't gate on it.
+        facts.append("SIC " + ", ".join(info["sic"][:2]) + f" (doesn't obviously match {lead.trade})")
     else:
-        reasons.append("SIC does not fit trade" + (f" ({', '.join(info['sic'][:2])})" if info.get("sic") else ""))
+        facts.append("no SIC code on file")
     return reasons, ", ".join(facts) if not reasons else "; ".join(reasons)
 
 

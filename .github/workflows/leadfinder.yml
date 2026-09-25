@@ -12,7 +12,7 @@ on:
         default: true
 
 permissions:
-  contents: write   # lets the job commit state.json so scheduled runs never go stale
+  contents: write  # lets the job commit state.json so scheduled runs never go stale
 
 concurrency:
   group: lead-finder
@@ -21,7 +21,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -39,11 +39,11 @@ jobs:
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
           COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          COMBOS_PER_RUN: "30"
-          OVERPASS_BUDGET_SECONDS: "480"
-          RUN_BUDGET_SECONDS: "660"
-          MAX_SITES_PER_RUN: "400"
-          CRAWL_WORKERS: "8"
+          COMBOS_PER_RUN: "90"
+          OVERPASS_BUDGET_SECONDS: "600"
+          RUN_BUDGET_SECONDS: "840"
+          MAX_SITES_PER_RUN: "500"
+          CRAWL_WORKERS: "12"
           MAX_NEW_PER_RUN: "1000"
           GOOGLE_MAX_REQUESTS: "12"
         run: python leadfinder.py
@@ -73,4 +73,5 @@ jobs:
           git config user.name "leadfinder-bot"
           git config user.email "leadfinder-bot@users.noreply.github.com"
           git add state.json || true
-          git diff --staged --quiet || (git commit -m "Update lead finder state" && git push)
+          git diff --staged --quiet || (
+git commit -m "Update lead finder state" && git push)

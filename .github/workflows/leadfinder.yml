@@ -2,10 +2,13 @@ name: Lead finder
 
 on:
   schedule:
-    # 5x/day (~every 4.8h), sized to the account-wide 2000 min/month GitHub Free Actions
-    # budget shared with other repos on this account - not just per-run cost. Odd minute
-    # avoids GitHub's busy top-of-hour queue.
-    - cron: "17 0,5,10,14,19 * * *"
+    # Hourly. Repo is now public, so GitHub Actions minutes are unlimited/free -
+    # that's no longer the limiting factor. The real ceiling now is the free
+    # OpenStreetMap Overpass mirrors' fair-use rate limits, which is why this
+    # isn't cranked higher (e.g. every 10 min) - it would just get us rate-limited
+    # (429s) without finding more leads, since each town/trade combo is only
+    # re-scanned once the rotation cursor cycles back around to it anyway.
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:

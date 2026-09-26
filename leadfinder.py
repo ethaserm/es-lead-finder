@@ -279,27 +279,10 @@ def overpass_query(query, session):
     return None
 
 
-def overpass_leads(trade, town, session):
-    tags = trade.get("osm", [])
-    if not tags:
-        return []
-    area_name = (town["osm"] if isinstance(town, dict) else town).replace("\\", "").replace('"', "")
-    bbox = ",".join(str(n) for n in UK_BBOX)
-    in_area = "".join(f'nwr["{k}"="{v}"](area.a);' for k, v in tags)
-    near_place = "".join(f'nwr["{k}"="{v}"](around.p:{PLACE_RADIUS_M});' for k, v in tags)
-    # Boundary area when OSM has one, else a radius around the town's place node; UK-only.
-    query = (
-        f'[out:json][timeout:{OVERPASS_SERVER_TIMEOUT}];'
-        f'rel["name"="{area_name}"]["boundary"="administrative"]({bbox});map_to_area->.a;'
-        f'node["name"="{area_name}"]["place"~"^(city|town)$"]({bbox})->.p;'
-        f"({in_area}{near_place});out center tags;"
-    )
-    data = overpass_query(query, session)
-    time.sleep(OVERPASS_QUERY_DELAY)  # stay well inside the public servers' fair-use limits
-    if data is None:
-        return None  # search failed; caller records it for a retry on a later run
+def _parse_overpass_elements(data, town):
+    """Shared element parsing: UK filter, dedupe, and the raw fields every Lead needs."""
     label = town["name"] if isinstance(town, dict) else town
-    leads = []
+    out = []
     for el in data.get("elements", []):
         tags = el.get("tags", {})
         name = tags.get("name")
@@ -313,12 +296,58 @@ def overpass_leads(trade, town, session):
         website = tags.get("website") or tags.get("contact:website") or ""
         phone = tags.get("phone") or tags.get("contact:phone") or ""
         addr = " ".join(filter(None, [tags.get("addr:street"), tags.get("addr:city"), tags.get("addr:postcode")]))
-        lead = Lead(name, trade["label"], label, website, phone, addr, "OpenStreetMap")
         tagged = tags.get("email") or tags.get("contact:email") or ""
-        lead.osm_emails = [e.strip().lower() for e in re.split(r"[;,]", tagged)
-                           if EMAIL_RE.fullmatch(e.strip())]
-        leads.append(lead)
-    return leads
+        emails = [e.strip().lower() for e in re.split(r"[;,]", tagged) if EMAIL_RE.fullmatch(e.strip())]
+        out.append((tags, name, website, phone, addr, emails, label))
+    return out
+
+
+def overpass_leads_batch(trades, town, session):
+    """One Overpass query for every trade in `trades` at this town, instead of one query each.
+
+    The boundary/place-node lookup is the expensive part of the query and is identical for every
+    trade at a given town, so batching them into a single query (tag filters unioned) cuts the
+    number of real requests against the shared public mirrors by roughly the trades-per-town
+    factor, without changing what data comes back. Returns {trade_label: [Lead, ...]}, or None if
+    the query failed (caller records every trade in `trades` as failed, same as a single failure).
+    """
+    area_name = (town["osm"] if isinstance(town, dict) else town).replace("\\", "").replace('"', "")
+    bbox = ",".join(str(n) for n in UK_BBOX)
+    parts = []
+    have_tags = False
+    for trade in trades:
+        for k, v in trade.get("osm", []):
+            have_tags = True
+            parts.append(f'nwr["{k}"="{v}"](area.a);')
+            parts.append(f'nwr["{k}"="{v}"](around.p:{PLACE_RADIUS_M});')
+    result = {t["label"]: [] for t in trades}
+    if not have_tags:
+        return result  # none of these trades search OSM (e.g. Google-Places-only trades)
+    query = (
+        f'[out:json][timeout:{OVERPASS_SERVER_TIMEOUT}];'
+        f'rel["name"="{area_name}"]["boundary"="administrative"]({bbox});map_to_area->.a;'
+        f'node["name"="{area_name}"]["place"~"^(city|town)$"]({bbox})->.p;'
+        f"({''.join(parts)});out center tags;"
+    )
+    data = overpass_query(query, session)
+    time.sleep(OVERPASS_QUERY_DELAY)  # stay well inside the public servers' fair-use limits
+    if data is None:
+        return None  # search failed; caller records it for a retry on a later run
+    for tags, name, website, phone, addr, emails, label in _parse_overpass_elements(data, town):
+        for trade in trades:
+            if any(tags.get(k) == v for k, v in trade.get("osm", [])):
+                lead = Lead(name, trade["label"], label, website, phone, addr, "OpenStreetMap")
+                lead.osm_emails = emails
+                result[trade["label"]].append(lead)
+    return result
+
+
+def overpass_leads(trade, town, session):
+    """Single-trade convenience wrapper around overpass_leads_batch (kept for callers/tests)."""
+    batch = overpass_leads_batch([trade], town, session)
+    if batch is None:
+        return None
+    return batch[trade["label"]]
 
 
 # --------------------------------------------------------------------------- source 2: Google Places
@@ -1010,15 +1039,27 @@ def run(dry_run, combos_per_run, max_new):
     picks, next_cursor = pick_with_retries(cfg, state, combos_per_run)
 
     pool, failed = {}, []
+    town_batches = {}  # town label -> {trade_label: [Lead,...]} or None, filled lazily
+
+    def town_key(t):
+        return t["name"] if isinstance(t, dict) else t
+
     for trade, town in picks:
-        label = town["name"] if isinstance(town, dict) else town
+        label = town_key(town)
+        if label not in town_batches:
+            # Fetch every trade assigned to this town in this run's picks in ONE Overpass query
+            # (the boundary lookup is identical per trade and is the expensive part), instead of
+            # one query per trade.
+            trades_here = [t for (t, tw) in picks if town_key(tw) == label]
+            town_batches[label] = overpass_leads_batch(trades_here, town, session)
+        batch = town_batches[label]
         log(f"searching: {trade['label']} in {label}")
-        found = overpass_leads(trade, town, session)
-        if found is None:
+        if batch is None:
             failed.append(combo_label(trade, town))
             log("  openstreetmap: FAILED, skipped (will retry on the next run)")
             found = []
         else:
+            found = list(batch.get(trade["label"], []))
             log(f"  openstreetmap: {len(found)}")
         if google_key:
             g = google_leads(trade, town, session, google_key, budget)

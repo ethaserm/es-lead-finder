@@ -2,18 +2,11 @@ name: Lead finder
 
 on:
   schedule:
-    # Every 30 min. There are 3,883 town/trade combos total and we're only ~25%
-    # through the very first full pass over all of them (cursor 955/3883 as of
-    # 2026-09-26), so for the next few hours, more frequent runs = genuinely new
-    # leads. Once the cursor wraps around once, this stops mattering: the script
-    # already skips any lead already in the Sheet (see known_names/known_hosts
-    # dedupe), so re-scanning the same combo again just gets silently skipped,
-    # not double-added. Not pushed past every 30 min because the free OSM
-    # Overpass mirrors rate-limit (429) under load - going faster risks more
-    # failed runs, not more leads. Fine to drop back to hourly (or less) once
-    # the first full pass completes; new leads after that only come from newly
-    # -mapped OSM data and the retry queue, both of which trickle in slowly.
-    - cron: "12,42 * * * *"
+    # Hourly - plenty of volume already (~40 leads/run => ~1000/day) and no need
+    # to push the free OSM Overpass mirrors any harder than that. Repo is public
+    # now so Actions minutes aren't the constraint; this is just picked for
+    # steady, reliable volume without extra rate-limit risk.
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:

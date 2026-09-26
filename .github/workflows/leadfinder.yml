@@ -2,8 +2,10 @@ name: Lead finder
 
 on:
   schedule:
-    # Every hour, every day (UTC). Odd minute avoids GitHub's busy top-of-hour queue.
-    - cron: "17 * * * *"
+    # 5x/day (~every 4.8h), sized to the account-wide 2000 min/month GitHub Free Actions
+    # budget shared with other repos on this account - not just per-run cost. Odd minute
+    # avoids GitHub's busy top-of-hour queue.
+    - cron: "17 0,5,10,14,19 * * *"
   workflow_dispatch:
     inputs:
       dry_run:

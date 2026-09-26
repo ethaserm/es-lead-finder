@@ -3,7 +3,7 @@ name: Lead finder
 on:
   schedule:
     # Every hour, every day (UTC). Odd minute avoids GitHub's busy top-of-hour queue.
-    - cron: "17 */6 * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:

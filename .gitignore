@@ -1,4 +1,5 @@
 output/
+osm_extract/
 __pycache__/
 *.pyc
 *.json

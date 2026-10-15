@@ -33,6 +33,7 @@ Finds small UK businesses from several free sources, merges them, pulls a real e
 
 ## Limits to know about
 
-- OpenStreetMap coverage of small UK trades is patchy, and its public Overpass server asks commercial users to use their own or a paid server. Treat it as a bonus source, not the foundation.
+- OpenStreetMap coverage of small UK trades is patchy. Treat it as a bonus source, not the foundation.
+- **Where the OpenStreetMap data comes from.** The public Overpass servers are free but often overloaded or down for hours, so the workflow also downloads the free Geofabrik Great Britain extract about once a week (`tools/build_osm_extract.sh`, cached by GitHub Actions) and searches that file directly (a 3 km circle round each town's place point, 6 km for a city). Overpass is only used for towns that are not in the file (Northern Ireland) or when the file is missing; set `LOCAL_OSM=0` to force Overpass. The run log says which one it used ("local OSM extract: ... built <date>").
 - Google's terms restrict how long Places data can be stored. Check them before relying on that source long term.
 - Cold email to sole traders/partnerships needs consent under PECR. Every email must clearly identify you and offer a way to opt out.

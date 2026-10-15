@@ -21,8 +21,10 @@ Run:  python leadfinder.py --dry-run     (no Sheet writes, writes output/*.csv)
 import argparse
 import csv
 import difflib
+import gzip
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -62,6 +64,10 @@ SHEETS_ATTEMPTS = 4           # tries for a Google Sheets call that hits a netwo
 SHEETS_BACKOFF = 5            # seconds; doubles each retry
 CH_GRACE_SECONDS = 90         # extra time after the crawl budget for Companies House checks
 PLACE_RADIUS_M = 3000        # search radius around a town's place node when it has no boundary
+LOCAL_EXTRACT_DIR = os.environ.get("OSM_EXTRACT_DIR") or os.path.join(HERE, "osm_extract")
+LOCAL_CITY_RADIUS_M = 6000   # the local search has no boundaries, so a city (bigger than a town) gets a wider circle
+LOCAL_EXTRACT_STALE_DAYS = 45
+_local_extract = None            # LocalExtract once load_local_extract() found one; None = use Overpass
 _overpass_deadline = None     # time.monotonic() after which Overpass searches are skipped
 _overpass_fail_counts = {}    # host -> failures in a row (reset by a success)
 _overpass_cooldown_until = {}  # host -> time.monotonic() before which the mirror sits out
@@ -308,6 +314,146 @@ def overpass_query(query, session):
     return None
 
 
+# --------------------------------------------------------------------------- source 1a: local OSM extract
+class LocalExtract:
+    """Businesses and towns from a Geofabrik Great Britain download (see tools/build_osm_extract.py).
+
+    This answers the same question as the Overpass query in overpass_leads_batch - "which businesses
+    with these tags are in / around this town?" - from a file on disk, so it does not depend on the
+    free public Overpass servers being up. Instead of the town's administrative boundary it uses a
+    circle around the town's place node (3 km, 6 km for a city)."""
+
+    CELL_DEG = 0.1  # grid cell size for the spatial index (about 11 km north-south)
+
+    def __init__(self, places, trades, meta=None):
+        self.meta = meta or {}
+        self.places = {}  # lower-case name -> [(lat, lon, place_type)]
+        for pl in places:
+            self.places.setdefault(pl["name"].strip().casefold(), []).append(
+                (pl["lat"], pl["lon"], pl.get("place", "town")))
+        self.count = 0
+        self.grid = {}  # (key, value) -> {(cell_lat, cell_lon): [record, ...]}
+        for rec in trades:
+            tags = rec.get("tags", {})
+            lat, lon = rec["lat"], rec["lon"]
+            cell = (math.floor(lat / self.CELL_DEG), math.floor(lon / self.CELL_DEG))
+            for k in ("craft", "shop", "amenity"):
+                if k in tags:
+                    self.grid.setdefault((k, tags[k]), {}).setdefault(cell, []).append(rec)
+            self.count += 1
+
+    def find_places(self, name):
+        return self.places.get((name or "").strip().casefold(), [])
+
+    @staticmethod
+    def _metres(lat1, lon1, lat2, lon2):
+        dy = (lat2 - lat1) * 111320.0
+        dx = (lon2 - lon1) * 111320.0 * math.cos(math.radians((lat1 + lat2) / 2))
+        return math.hypot(dx, dy)
+
+    def near(self, pairs, lat, lon, radius_m):
+        """Records tagged with any (key, value) in `pairs` within radius_m of (lat, lon)."""
+        dlat = radius_m / 111320.0
+        dlon = radius_m / (111320.0 * max(math.cos(math.radians(lat)), 0.2))
+        lat_cells = range(math.floor((lat - dlat) / self.CELL_DEG), math.floor((lat + dlat) / self.CELL_DEG) + 1)
+        lon_cells = range(math.floor((lon - dlon) / self.CELL_DEG), math.floor((lon + dlon) / self.CELL_DEG) + 1)
+        out = []
+        for pair in pairs:
+            cells = self.grid.get(pair)
+            if not cells:
+                continue
+            for cl in lat_cells:
+                for cn in lon_cells:
+                    for rec in cells.get((cl, cn), ()):
+                        if self._metres(lat, lon, rec["lat"], rec["lon"]) <= radius_m:
+                            out.append(rec)
+        return out
+
+    def search(self, trades, town):
+        """Overpass-shaped {"elements": [...]} for every trade tag at this town, or None when the
+        town is not in the extract (the caller then asks Overpass instead)."""
+        names = []
+        for n in ((town.get("osm"), town.get("name")) if isinstance(town, dict) else (town,)):
+            if n and n not in names:
+                names.append(n)
+        nodes = []
+        for n in names:
+            nodes = self.find_places(n)
+            if nodes:
+                break
+        if not nodes:
+            return None
+        pairs = {(k, v) for t in trades for k, v in t.get("osm", [])}
+        seen, elements = set(), []
+        for lat, lon, kind in nodes:
+            radius = LOCAL_CITY_RADIUS_M if kind == "city" else PLACE_RADIUS_M
+            for rec in self.near(pairs, lat, lon, radius):
+                ident = rec["id"] if rec["id"] is not None else (rec["lat"], rec["lon"], rec["tags"].get("name"))
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                elements.append({"type": "node", "id": rec["id"], "lat": rec["lat"], "lon": rec["lon"],
+                                 "tags": rec["tags"]})
+        return {"elements": elements}
+
+
+def _read_jsonl_gz(path):
+    out = []
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue  # a damaged line is skipped, not fatal
+    return out
+
+
+def load_local_extract(directory=None):
+    """Load the extract built by tools/build_osm_extract.sh into the module-level `_local_extract`.
+
+    Returns it, or None (and Overpass is used for every search) when it is switched off with
+    LOCAL_OSM=0, missing, or unreadable."""
+    global _local_extract
+    _local_extract = None
+    if not env_flag("LOCAL_OSM", True):
+        log("local OSM extract: switched off (LOCAL_OSM=0) - using Overpass")
+        return None
+    directory = directory or LOCAL_EXTRACT_DIR
+    trades_path = os.path.join(directory, "trades.jsonl.gz")
+    places_path = os.path.join(directory, "places.jsonl.gz")
+    if not (os.path.isfile(trades_path) and os.path.isfile(places_path)):
+        log("local OSM extract: not found - using Overpass")
+        return None
+    try:
+        meta = {}
+        meta_path = os.path.join(directory, "meta.json")
+        if os.path.isfile(meta_path):
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        places = [p for p in _read_jsonl_gz(places_path) if p.get("name") and "lat" in p and "lon" in p]
+        trades = [t for t in _read_jsonl_gz(trades_path) if "lat" in t and "lon" in t and "id" in t]
+        if not places or not trades:
+            raise ValueError("the extract is empty")
+        extract = LocalExtract(places, trades, meta)
+    except (OSError, ValueError, EOFError, KeyError, TypeError) as exc:
+        log(f"local OSM extract: unreadable ({exc}) - using Overpass")
+        return None
+    built = str(meta.get("built_at", ""))[:10]
+    note = ""
+    try:
+        age = (date.today() - date.fromisoformat(built)).days
+        if age > LOCAL_EXTRACT_STALE_DAYS:
+            note = f" - WARNING: {age} days old, the weekly rebuild may be failing"
+    except ValueError:
+        pass
+    log(f"local OSM extract: {extract.count} businesses, {len(places)} towns, built {built or 'unknown'}{note}")
+    _local_extract = extract
+    return extract
+
+
 def _parse_overpass_elements(data, town):
     """Shared element parsing: UK filter, dedupe, and the raw fields every Lead needs."""
     label = town["name"] if isinstance(town, dict) else town
@@ -352,16 +498,18 @@ def overpass_leads_batch(trades, town, session):
     result = {t["label"]: [] for t in trades}
     if not have_tags:
         return result  # none of these trades search OSM (e.g. Google-Places-only trades)
-    query = (
-        f'[out:json][timeout:{OVERPASS_SERVER_TIMEOUT}];'
-        f'rel["name"="{area_name}"]["boundary"="administrative"]({bbox});map_to_area->.a;'
-        f'node["name"="{area_name}"]["place"~"^(city|town)$"]({bbox})->.p;'
-        f"({''.join(parts)});out center tags;"
-    )
-    data = overpass_query(query, session)
-    time.sleep(OVERPASS_QUERY_DELAY)  # stay well inside the public servers' fair-use limits
-    if data is None:
-        return None  # search failed; caller records it for a retry on a later run
+    data = _local_extract.search(trades, town) if _local_extract is not None else None
+    if data is None:  # no local extract, or the town is not in it: ask Overpass
+        query = (
+            f'[out:json][timeout:{OVERPASS_SERVER_TIMEOUT}];'
+            f'rel["name"="{area_name}"]["boundary"="administrative"]({bbox});map_to_area->.a;'
+            f'node["name"="{area_name}"]["place"~"^(city|town)$"]({bbox})->.p;'
+            f"({''.join(parts)});out center tags;"
+        )
+        data = overpass_query(query, session)
+        time.sleep(OVERPASS_QUERY_DELAY)  # stay well inside the public servers' fair-use limits
+        if data is None:
+            return None  # search failed; caller records it for a retry on a later run
     for tags, name, website, phone, addr, emails, label in _parse_overpass_elements(data, town):
         for trade in trades:
             if any(tags.get(k) == v for k, v in trade.get("osm", [])):
@@ -1076,6 +1224,7 @@ def run(dry_run, combos_per_run, max_new):
     started = time.monotonic()
     _overpass_deadline = started + env_int("OVERPASS_BUDGET_SECONDS", 240)
     _reset_overpass_state()
+    load_local_extract()
     run_deadline = started + env_int("RUN_BUDGET_SECONDS", 380)
     cfg = load_config()
     session = requests.Session()

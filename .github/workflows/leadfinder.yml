@@ -24,7 +24,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +34,41 @@ jobs:
           cache: pip
 
       - run: pip install -r requirements.txt
+
+      # A free local copy of the UK OpenStreetMap data (Geofabrik), rebuilt about once a week and cached.
+      # The public Overpass servers are often down for hours, so leadfinder.py searches this copy first
+      # and only asks Overpass for towns that are not in it (e.g. Northern Ireland). If the build fails
+      # the run carries on with the last cached copy, or with Overpass alone.
+      - name: Map data cache key (one per week)
+        id: week
+        run: echo "key=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore map data
+        id: osm_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: osm_extract
+          key: osm-extract-${{ steps.week.outputs.key }}
+          restore-keys: |
+            osm-extract-
+
+      - name: Build map data
+        id: osm_build
+        if: steps.osm_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool
+          bash tools/build_osm_extract.sh osm_extract
+
+      - name: Save map data
+        if: steps.osm_build.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: osm_extract
+          key: osm-extract-${{ steps.week.outputs.key }}
 
       - name: Find leads
         env:

@@ -1,6 +1,10 @@
+import gzip
+import io
+import json
 import os
 import re
 import sys
+import tempfile
 import time
 import unittest
 from datetime import date
@@ -51,6 +55,11 @@ class Tests(unittest.TestCase):
     def setUp(self):
         lf._reset_overpass_state()  # mirror cooldowns from one test must not leak into the next
         lf._overpass_deadline = None  # nor a time budget left over from a test that ran the whole pipeline
+        lf._local_extract = None  # tests use Overpass (faked) unless they load an extract on purpose
+        patch = mock.patch.object(lf, "LOCAL_EXTRACT_DIR", os.path.join(tempfile.gettempdir(), "no-such-osm-extract"))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(setattr, lf, "_local_extract", None)
 
     def test_norm_name(self):
         self.assertEqual(lf.norm_name("S&O Conversions Ltd"), lf.norm_name("S and O Conversions Limited"))
@@ -409,7 +418,7 @@ class Tests(unittest.TestCase):
         self.assertRegex(cron[0], r"^\d+$")  # one fixed minute, not top of the hour
         self.assertNotEqual(cron[0], "0")
         env = {k: int(v) for k, v in re.findall(r'^\s+([A-Z_]+):\s*"(\d+)"', text, re.M)}
-        self.assertEqual(env["COMBOS_PER_RUN"], 30)
+        self.assertEqual(env["COMBOS_PER_RUN"], 350)
         self.assertGreaterEqual(env["MAX_NEW_PER_RUN"], 500)
         self.assertGreaterEqual(env["MAX_SITES_PER_RUN"], 400)
         timeout = int(re.search(r"timeout-minutes:\s*(\d+)", text).group(1)) * 60
@@ -755,7 +764,7 @@ class Tests(unittest.TestCase):
     def test_osm_email_tags_are_read_and_merged(self):
         trade = {"label": "Plumber", "osm": [["craft", "plumber"]]}
         data = {"elements": [{"type": "node", "lat": 53.9, "lon": -1.1, "tags": {
-            "name": "Foo", "website": "http://foo.co.uk", "contact:email": "Hello@Foo.co.uk; not-an-email"}}]}
+            "name": "Foo", "craft": "plumber", "website": "http://foo.co.uk", "contact:email": "Hello@Foo.co.uk; not-an-email"}}]}
         with mock.patch.object(lf, "overpass_query", return_value=data), mock.patch("time.sleep"):
             leads = lf.overpass_leads(trade, "York", None)
         self.assertEqual(leads[0].osm_emails, ["hello@foo.co.uk"])
@@ -803,7 +812,8 @@ class Tests(unittest.TestCase):
         ]
         found = ([("info@foo.co.uk", "Website homepage (mailto link)")], 0, True)
         with mock.patch.dict(os.environ, {"COMPANIES_HOUSE_API_KEY": "k"}, clear=False), \
-                mock.patch.object(lf, "overpass_leads", return_value=leads), \
+                mock.patch.object(lf, "overpass_leads_batch",
+                                  side_effect=lambda trades, town, session: {trades[0]["label"]: list(leads)}), \
                 mock.patch.object(lf.SiteCrawler, "collect", return_value=found), \
                 mock.patch.object(lf, "mx_status", return_value="ok"), \
                 mock.patch.object(lf, "companies_house_lookup", return_value=info), \
@@ -828,6 +838,215 @@ class Tests(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertIn("[foo.co.uk] Review - accounts: full", logged)
         self.assertNotIn("] Pending", logged)
+
+
+def _write_extract(directory, places, trades, meta=None):
+    with gzip.open(os.path.join(directory, "places.jsonl.gz"), "wt", encoding="utf-8") as fh:
+        for p in places:
+            fh.write(json.dumps(p) + "\n")
+    with gzip.open(os.path.join(directory, "trades.jsonl.gz"), "wt", encoding="utf-8") as fh:
+        for t in trades:
+            fh.write(json.dumps(t) + "\n")
+    with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta or {"built_at": date.today().isoformat(), "source": "test"}, fh)
+
+
+def _biz(ident, lat, lon, **tags):
+    tags.setdefault("name", f"Biz {ident}")
+    return {"id": ident, "lat": lat, "lon": lon, "tags": tags}
+
+
+def _logged(lg):
+    return "\n".join(str(c.args[0]) for c in lg.call_args_list)
+
+
+class LocalExtractTests(unittest.TestCase):
+    """The local OpenStreetMap extract that replaces the unreliable public Overpass servers."""
+
+    CREWE = (53.0996, -2.4414)
+
+    def setUp(self):
+        lf._reset_overpass_state()
+        lf._overpass_deadline = None
+        lf._local_extract = None
+        self.addCleanup(setattr, lf, "_local_extract", None)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+
+    def _extract(self, places, trades, **kw):
+        _write_extract(self.dir, places, trades, **kw)
+        with mock.patch.object(lf, "log"):
+            ex = lf.load_local_extract(self.dir)
+        self.assertIsNotNone(ex)
+        return ex
+
+    def _town(self, name="Crewe", kind="town", at=CREWE):
+        return {"name": name, "lat": at[0], "lon": at[1], "place": kind}
+
+    def _ids(self, data):
+        return sorted(e["id"] for e in data["elements"])
+
+    def test_finds_businesses_within_the_town_radius_only(self):
+        lat, lon = self.CREWE
+        ex = self._extract([self._town()], [
+            _biz("n1", lat + 0.02, lon, craft="electrician"),   # about 2.2 km: inside
+            _biz("n2", lat + 0.03, lon, craft="electrician"),   # about 3.3 km: outside a 3 km town circle
+            _biz("n3", lat, lon + 0.03, craft="electrician"),   # 1.9 km east (longitudes are shorter): inside
+            _biz("n4", lat, lon + 0.06, craft="electrician"),   # 4 km east: outside
+        ])
+        trade = {"label": "Electrician", "osm": [["craft", "electrician"]]}
+        self.assertEqual(self._ids(ex.search([trade], "Crewe")), ["n1", "n3"])
+
+    def test_a_city_gets_a_wider_circle_than_a_town(self):
+        lat, lon = 53.19, -2.89
+        trades = [_biz("n1", lat + 0.05, lon, shop="hairdresser"), _biz("n2", lat + 0.07, lon, shop="hairdresser")]
+        trade = {"label": "Hair", "osm": [["shop", "hairdresser"]]}
+        city = self._extract([self._town("Chester", "city", (lat, lon))], trades)
+        self.assertEqual(self._ids(city.search([trade], "Chester")), ["n1"])  # 5.6 km in, 7.8 km out
+        town = self._extract([self._town("Chester", "town", (lat, lon))], trades)
+        self.assertEqual(self._ids(town.search([trade], "Chester")), [])
+
+    def test_businesses_just_across_a_grid_cell_boundary_are_found(self):
+        lat, lon = 53.099, -2.499  # a hair south-east of the 0.1 degree cell corner at 53.1 / -2.5
+        ex = self._extract([self._town("Edge", "town", (lat, lon))],
+                           [_biz("n1", 53.115, -2.51, shop="hairdresser"), _biz("n2", 53.085, -2.49, shop="hairdresser")])
+        trade = {"label": "Hair", "osm": [["shop", "hairdresser"]]}
+        self.assertEqual(self._ids(ex.search([trade], "Edge")), ["n1", "n2"])
+
+    def test_only_the_requested_trade_tags_match(self):
+        lat, lon = self.CREWE
+        ex = self._extract([self._town()], [
+            _biz("n1", lat, lon, craft="plumber"), _biz("n2", lat, lon, shop="hairdresser"),
+            _biz("n3", lat, lon, amenity="cafe"), _biz("n4", lat, lon, craft="plumber", amenity="cafe"),
+        ])
+        plumber = {"label": "Plumber", "osm": [["craft", "plumber"]]}
+        both = {"label": "Cafe", "osm": [["amenity", "cafe"]]}
+        self.assertEqual(self._ids(ex.search([plumber], "Crewe")), ["n1", "n4"])
+        self.assertEqual(self._ids(ex.search([plumber, both], "Crewe")), ["n1", "n3", "n4"])  # n4 once, not twice
+
+    def test_unknown_town_returns_none_so_overpass_is_used(self):
+        ex = self._extract([self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        self.assertIsNone(ex.search([{"label": "P", "osm": [["craft", "plumber"]]}], "Atlantis"))
+
+    def test_town_lookup_is_case_insensitive_and_prefers_the_osm_name(self):
+        lat, lon = 53.74, -0.33
+        ex = self._extract([self._town("Kingston upon Hull", "city", (lat, lon)), self._town("Hull", "town", (60.0, -1.0))],
+                           [_biz("n1", lat, lon, craft="plumber"), _biz("n2", 60.0, -1.0, craft="plumber")])
+        trade = {"label": "P", "osm": [["craft", "plumber"]]}
+        town = {"name": "Hull", "osm": "kingston UPON hull"}
+        self.assertEqual(self._ids(ex.search([trade], town)), ["n1"])  # the osm name wins over the display name
+
+    def test_display_name_is_the_fallback_when_the_osm_name_is_not_in_the_extract(self):
+        ex = self._extract([self._town("Hull", "city", (53.74, -0.33))], [_biz("n1", 53.74, -0.33, craft="plumber")])
+        town = {"name": "Hull", "osm": "Kingston upon Hull"}
+        self.assertEqual(self._ids(ex.search([{"label": "P", "osm": [["craft", "plumber"]]}], town)), ["n1"])
+
+    def test_towns_sharing_a_name_are_all_searched_without_duplicates(self):
+        a, b = (50.70, -1.29), (51.58, -3.00)  # two Newports, far apart
+        ex = self._extract([self._town("Newport", "town", a), self._town("Newport", "city", b), self._town("Newport", "town", a)],
+                           [_biz("n1", *a, craft="plumber"), _biz("n2", *b, craft="plumber")])
+        self.assertEqual(self._ids(ex.search([{"label": "P", "osm": [["craft", "plumber"]]}], "Newport")), ["n1", "n2"])
+
+    def test_batch_uses_the_extract_and_never_calls_overpass(self):
+        lat, lon = self.CREWE
+        ex = self._extract([self._town()], [
+            _biz("w5", lat, lon, shop="hairdresser", name="Shear Genius", website="https://shear.example.co.uk",
+                 phone="01270 000000", email="hello@shear.example.co.uk"),
+            _biz("n6", lat, lon, craft="plumber", name="Pipe Dream"),
+            {"id": "n7", "lat": lat, "lon": lon, "tags": {"craft": "plumber"}},  # no name: not a lead
+            _biz("n8", 10.0, 10.0, craft="plumber"),                             # outside the UK
+        ])
+        lf._local_extract = ex
+        trades = [{"label": "Hair", "osm": [["shop", "hairdresser"]]}, {"label": "Plumber", "osm": [["craft", "plumber"]]},
+                  {"label": "Pest control", "osm": []}]
+        with mock.patch.object(lf, "overpass_query", side_effect=AssertionError("Overpass must not be called")), \
+                mock.patch.object(lf.time, "sleep", side_effect=AssertionError("no polite pause is needed locally")):
+            result = lf.overpass_leads_batch(trades, "Crewe", None)
+        self.assertEqual([l.name for l in result["Hair"]], ["Shear Genius"])
+        self.assertEqual(result["Hair"][0].website, "https://shear.example.co.uk/")
+        self.assertEqual(result["Hair"][0].osm_emails, ["hello@shear.example.co.uk"])
+        self.assertEqual(result["Hair"][0].area, "Crewe")
+        self.assertEqual([l.name for l in result["Plumber"]], ["Pipe Dream"])
+        self.assertEqual(result["Pest control"], [])
+
+    def test_batch_falls_back_to_overpass_for_a_town_the_extract_does_not_know(self):
+        lf._local_extract = self._extract([self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        fake = {"elements": [{"type": "node", "id": 9, "lat": 54.6, "lon": -5.9,
+                              "tags": {"name": "Belfast Boiler Co", "craft": "plumber"}}]}
+        trades = [{"label": "Plumber", "osm": [["craft", "plumber"]]}]
+        with mock.patch.object(lf, "overpass_query", return_value=fake) as q, mock.patch.object(lf.time, "sleep"):
+            result = lf.overpass_leads_batch(trades, {"name": "Belfast", "osm": "Belfast"}, None)
+        q.assert_called_once()
+        self.assertEqual([l.name for l in result["Plumber"]], ["Belfast Boiler Co"])
+
+    def test_batch_without_an_extract_still_uses_overpass(self):
+        trades = [{"label": "Plumber", "osm": [["craft", "plumber"]]}]
+        with mock.patch.object(lf, "overpass_query", return_value=None) as q, mock.patch.object(lf.time, "sleep"):
+            self.assertIsNone(lf.overpass_leads_batch(trades, "Crewe", None))
+        q.assert_called_once()
+
+    def test_load_returns_none_when_the_extract_is_missing(self):
+        with mock.patch.object(lf, "log") as lg:
+            self.assertIsNone(lf.load_local_extract(os.path.join(self.dir, "nope")))
+        self.assertIn("not found", _logged(lg))
+        self.assertIsNone(lf._local_extract)
+
+    def test_load_returns_none_for_a_corrupt_file(self):
+        _write_extract(self.dir, [self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        with open(os.path.join(self.dir, "trades.jsonl.gz"), "wb") as fh:
+            fh.write(b"this is not gzip data")
+        with mock.patch.object(lf, "log") as lg:
+            self.assertIsNone(lf.load_local_extract(self.dir))
+        self.assertIn("unreadable", _logged(lg))
+
+    def test_load_returns_none_for_an_empty_extract(self):
+        _write_extract(self.dir, [], [])
+        with mock.patch.object(lf, "log"):
+            self.assertIsNone(lf.load_local_extract(self.dir))
+
+    def test_load_skips_damaged_lines(self):
+        _write_extract(self.dir, [self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        with gzip.open(os.path.join(self.dir, "trades.jsonl.gz"), "at", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+            fh.write(json.dumps({"id": "n2", "tags": {}}) + "\n")  # no location
+            fh.write(json.dumps(_biz("n3", *self.CREWE, craft="plumber")) + "\n")
+        with mock.patch.object(lf, "log"):
+            ex = lf.load_local_extract(self.dir)
+        self.assertEqual(ex.count, 2)
+
+    def test_load_can_be_switched_off(self):
+        _write_extract(self.dir, [self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        with mock.patch.dict(os.environ, {"LOCAL_OSM": "0"}), mock.patch.object(lf, "log") as lg:
+            self.assertIsNone(lf.load_local_extract(self.dir))
+        self.assertIn("switched off", _logged(lg))
+
+    def test_load_logs_the_build_date_and_warns_when_it_is_stale(self):
+        _write_extract(self.dir, [self._town()], [_biz("n1", *self.CREWE, craft="plumber")],
+                       meta={"built_at": "2020-01-02T03:04:05Z"})
+        with mock.patch.object(lf, "log") as lg:
+            self.assertIsNotNone(lf.load_local_extract(self.dir))
+        text = _logged(lg)
+        self.assertIn("1 businesses, 1 towns, built 2020-01-02", text)
+        self.assertIn("WARNING", text)
+
+    def test_load_works_without_meta_json(self):
+        _write_extract(self.dir, [self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        os.remove(os.path.join(self.dir, "meta.json"))
+        with mock.patch.object(lf, "log") as lg:
+            self.assertIsNotNone(lf.load_local_extract(self.dir))
+        self.assertIn("built unknown", _logged(lg))
+
+    def test_run_loads_the_extract_from_the_configured_folder(self):
+        _write_extract(self.dir, [self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        with mock.patch.object(lf, "LOCAL_EXTRACT_DIR", self.dir), \
+                mock.patch.object(lf, "load_config", return_value={"trades": [], "towns": [], "queue_tab": "q", "tracker_tab": "t"}), \
+                mock.patch.object(lf, "log") as lg, mock.patch.object(lf, "pick_with_retries", return_value=([], 0)), \
+                mock.patch.object(lf, "load_state", return_value={}), \
+                mock.patch.dict(os.environ, {"COMPANIES_HOUSE_API_KEY": "", "GOOGLE_PLACES_API_KEY": "",
+                                             "SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": ""}):
+            lf.run(True, 1, 10)
+        self.assertIn("local OSM extract: 1 businesses", _logged(lg))
 
 
 if __name__ == "__main__":

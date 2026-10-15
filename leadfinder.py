@@ -41,23 +41,30 @@ HTML_HEADERS = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml"}
 UK_BBOX = (49.8, -8.7, 60.9, 1.8)  # south, west, north, east
 
 OVERPASS_URLS = [
+    # In priority order. The first usable mirror is tried first; one that fails sits out for a
+    # while (see OVERPASS_COOLDOWN_*) and the next one is used, then it is tried again later.
     "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",  # full planet, live data; slower but steady
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
-OVERPASS_ATTEMPTS = 3         # first try + at most 2 retries
+OVERPASS_ATTEMPTS = 6         # real requests per query (first try + retries), each on the next usable mirror
 OVERPASS_BACKOFF_BASE = 2     # seconds; doubles each retry, capped below
-OVERPASS_BACKOFF_CAP = 6
+OVERPASS_BACKOFF_CAP = 10
 OVERPASS_QUERY_DELAY = 4      # polite pause after every query
-OVERPASS_REQUEST_TIMEOUT = (5, 25)  # connect, read: give the server room to hit its own 20s budget
-OVERPASS_SERVER_TIMEOUT = 20  # seconds the Overpass server may spend on a query
-OVERPASS_DEAD_THRESHOLD = 4   # times a mirror may fail before we stop trying it this run (tolerate one bad combo)
+OVERPASS_REQUEST_TIMEOUT = (5, 35)  # connect, read: a bit longer than the 30s the server itself may spend
+OVERPASS_SERVER_TIMEOUT = 30  # seconds the Overpass server may spend on a query
+OVERPASS_COOLDOWN_STEP = 45   # a mirror that fails sits out this long per failure in a row...
+OVERPASS_COOLDOWN_CAP = 180   # ...up to this many seconds, then it is tried again (it may have recovered)
+OVERPASS_MAX_WAITS = 2        # times one query may wait for a cooling-down mirror when every mirror is out
+OVERPASS_MAX_WAIT_SECONDS = 60
+SHEETS_ATTEMPTS = 4           # tries for a Google Sheets call that hits a network blip / 5xx / 429
+SHEETS_BACKOFF = 5            # seconds; doubles each retry
 CH_GRACE_SECONDS = 90         # extra time after the crawl budget for Companies House checks
 PLACE_RADIUS_M = 3000        # search radius around a town's place node when it has no boundary
-_overpass_next = 0
 _overpass_deadline = None     # time.monotonic() after which Overpass searches are skipped
-_overpass_dead = set()        # hosts that failed OVERPASS_DEAD_THRESHOLD times this run
-_overpass_fail_counts = {}    # host -> failure count this run
+_overpass_fail_counts = {}    # host -> failures in a row (reset by a success)
+_overpass_cooldown_until = {}  # host -> time.monotonic() before which the mirror sits out
 
 BLOCKED_SITE_HOSTS = (
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
@@ -223,57 +230,79 @@ class Lead:
 
 
 # --------------------------------------------------------------------------- source 1: OpenStreetMap
-def overpass_query(query, session):
-    """POST a query, rotating mirrors and backing off exponentially on 429/5xx/timeouts.
+def _reset_overpass_state():
+    _overpass_fail_counts.clear()
+    _overpass_cooldown_until.clear()
 
-    A mirror that fails OVERPASS_DEAD_THRESHOLD times in this run is treated as down and
-    skipped for the rest of the run, so later searches don't keep paying its full timeout
-    for nothing once we already know it's unreachable today.
+
+def _next_overpass_mirror(now):
+    """First mirror in priority order that is not sitting out a cooldown, or None."""
+    for url in OVERPASS_URLS:
+        if _overpass_cooldown_until.get(host_of(url), 0) <= now:
+            return url
+    return None
+
+
+def overpass_query(query, session):
+    """POST a query to the public Overpass mirrors, retrying patiently.
+
+    The free public mirrors are often overloaded or down for hours. A mirror that fails is not
+    written off for the whole run: it sits out a cooldown that grows with each failure in a
+    row (OVERPASS_COOLDOWN_*), the query moves to the next mirror, and the failed one is tried
+    again once its cooldown is over. If every mirror is cooling down the query waits for the
+    soonest one (within the run's Overpass time budget) instead of giving up.
+
+    An HTTP 200 whose JSON carries a "runtime error" remark (the server timed out or ran out of
+    memory) is a failure too, not a genuine "no results".
     """
-    global _overpass_next
-    live = [u for u in OVERPASS_URLS if host_of(u) not in _overpass_dead]
-    if not live:
-        log("    overpass: all mirrors down this run; skipping")
-        return None
-    attempts = min(OVERPASS_ATTEMPTS, len(live))
-    for attempt in range(attempts):
-        if _overpass_deadline is not None and time.monotonic() >= _overpass_deadline:
+    tries = waits = 0
+    while tries < OVERPASS_ATTEMPTS:
+        now = time.monotonic()
+        if _overpass_deadline is not None and now >= _overpass_deadline:
             log("    overpass time budget used up; skipping")
             return None
-        url = live[_overpass_next % len(live)]
+        url = _next_overpass_mirror(now)
+        if url is None:
+            soonest = min(_overpass_cooldown_until.values())
+            wait = min(max(soonest - now, 1), OVERPASS_MAX_WAIT_SECONDS)
+            if waits >= OVERPASS_MAX_WAITS or (
+                    _overpass_deadline is not None and now + wait >= _overpass_deadline):
+                log("    overpass: every mirror is cooling down; giving up on this query")
+                return None
+            waits += 1
+            log(f"    overpass: every mirror is cooling down; waiting {wait:.0f}s")
+            time.sleep(wait)
+            continue
         host = host_of(url)
-        retry = False
         try:
             resp = session.post(url, data={"data": query}, headers={"User-Agent": UA},
                                 timeout=OVERPASS_REQUEST_TIMEOUT)
         except requests.RequestException as exc:
             log(f"    overpass {host} error: {type(exc).__name__}")
-            retry = True
         else:
             if resp.status_code == 200:
                 try:
-                    return resp.json()
+                    data = resp.json()
                 except ValueError:
                     log(f"    overpass {host} returned invalid JSON")
-                    retry = True
-            elif resp.status_code in (429, 406, 500, 502, 503, 504):
-                log(f"    overpass {host} returned {resp.status_code}")
-                retry = True
+                else:
+                    remark = str(data.get("remark", "")) if isinstance(data, dict) else ""
+                    if "runtime error" not in remark.lower():
+                        _overpass_fail_counts[host] = 0
+                        _overpass_cooldown_until.pop(host, None)
+                        return data
+                    log(f"    overpass {host} gave up on the query: {remark[:80]}")
             else:
                 log(f"    overpass {host} returned {resp.status_code}")
-                retry = True  # try another mirror rather than give up
-        if retry:
-            _overpass_fail_counts[host] = _overpass_fail_counts.get(host, 0) + 1
-            if _overpass_fail_counts[host] >= OVERPASS_DEAD_THRESHOLD and host not in _overpass_dead:
-                _overpass_dead.add(host)
-                log(f"    overpass {host}: marking down for the rest of this run")
-        _overpass_next += 1  # next attempt goes to the next mirror
-        if retry and attempt < attempts - 1:
-            live = [u for u in OVERPASS_URLS if host_of(u) not in _overpass_dead]
-            if not live:
-                break
-            wait = min(OVERPASS_BACKOFF_BASE * 2 ** attempt, OVERPASS_BACKOFF_CAP)
-            log(f"    retrying on {host_of(live[_overpass_next % len(live)])} in {wait}s")
+        # failed: bench this mirror for a while and move on to the next one
+        fails = _overpass_fail_counts.get(host, 0) + 1
+        _overpass_fail_counts[host] = fails
+        cooldown = min(OVERPASS_COOLDOWN_STEP * fails, OVERPASS_COOLDOWN_CAP)
+        _overpass_cooldown_until[host] = time.monotonic() + cooldown
+        tries += 1
+        if tries < OVERPASS_ATTEMPTS:
+            wait = min(OVERPASS_BACKOFF_BASE * 2 ** (tries - 1), OVERPASS_BACKOFF_CAP)
+            log(f"    retrying in {wait}s")
             time.sleep(wait)
     log("    overpass: giving up on this query after all retries")
     return None
@@ -826,6 +855,59 @@ def col_index(header, key):
     return None
 
 
+def _sheets_transient(exc):
+    """True for errors worth retrying: a dropped connection, a timeout, a 429 or a 5xx from Google."""
+    import gspread
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                        requests.exceptions.ChunkedEncodingError)):
+        return True
+    if isinstance(exc, gspread.exceptions.APIError):
+        status = getattr(getattr(exc, "response", None), "status_code", 0)
+        return status in (429, 500, 502, 503, 504)
+    return False
+
+
+def sheets_retry(fn, what):
+    """Run fn(), retrying transient Google Sheets failures with a growing pause."""
+    for attempt in range(SHEETS_ATTEMPTS):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == SHEETS_ATTEMPTS - 1 or not _sheets_transient(exc):
+                raise
+            wait = SHEETS_BACKOFF * 2 ** attempt
+            log(f"  google sheets: {what} failed ({type(exc).__name__}); retrying in {wait}s")
+            time.sleep(wait)
+
+
+def append_new_rows(ws, rows, header):
+    """Append rows to the queue tab, surviving a dropped connection.
+
+    A connection can drop after Google has already applied the write, so a blind retry could add
+    the same rows twice. Before each retry the tab is re-read and only rows whose email is not
+    already there are sent again. If that check itself cannot be done the error is raised
+    (leads are re-found on the next run because state is only saved after a successful write).
+    """
+    email_i = col_index(header, "email")
+    pending = list(rows)
+    for attempt in range(SHEETS_ATTEMPTS):
+        try:
+            ws.append_rows(pending, value_input_option="RAW")
+            return len(pending)
+        except Exception as exc:
+            if attempt == SHEETS_ATTEMPTS - 1 or not _sheets_transient(exc):
+                raise
+            wait = SHEETS_BACKOFF * 2 ** attempt
+            log(f"  google sheets: appending rows failed ({type(exc).__name__}); retrying in {wait}s")
+            time.sleep(wait)
+            if email_i is not None:
+                present = {r[email_i].strip().lower() for r in ws.get_all_values() if email_i < len(r)}
+                pending = [r for r in pending if r[email_i].strip().lower() not in present]
+                if not pending:
+                    log("  google sheets: the earlier attempt had already saved every row")
+                    return 0
+
+
 def load_known(sh, tabs):
     names, emails, hosts = set(), set(), set()
     for tab in tabs:
@@ -993,6 +1075,7 @@ def run(dry_run, combos_per_run, max_new):
     global _overpass_deadline
     started = time.monotonic()
     _overpass_deadline = started + env_int("OVERPASS_BUDGET_SECONDS", 240)
+    _reset_overpass_state()
     run_deadline = started + env_int("RUN_BUDGET_SECONDS", 380)
     cfg = load_config()
     session = requests.Session()
@@ -1019,17 +1102,19 @@ def run(dry_run, combos_per_run, max_new):
     if sheet_id and sa_json:
         import gspread
         gc = gspread.service_account_from_dict(json.loads(sa_json))
-        sh = gc.open_by_key(sheet_id)
-        log(f"tabs in the sheet: {[w.title for w in sh.worksheets()]}")
-        known_names, known_emails, known_hosts = load_known(sh, [cfg["queue_tab"], cfg["tracker_tab"]])
-        suppressed_emails, suppressed_domains = load_suppression(
-            sh, cfg.get("suppression_tabs", [cfg["tracker_tab"], "Replies"]))
+        sh = sheets_retry(lambda: gc.open_by_key(sheet_id), "opening the sheet")
+        log(f"tabs in the sheet: {[w.title for w in sheets_retry(sh.worksheets, 'listing tabs')]}")
+        known_names, known_emails, known_hosts = sheets_retry(
+            lambda: load_known(sh, [cfg["queue_tab"], cfg["tracker_tab"]]), "reading known leads")
+        suppressed_emails, suppressed_domains = sheets_retry(
+            lambda: load_suppression(sh, cfg.get("suppression_tabs", [cfg["tracker_tab"], "Replies"])),
+            "reading the suppression lists")
         if not dry_run:
             try:
                 ws = sh.worksheet(cfg["queue_tab"])
             except Exception:
                 ws = sh.add_worksheet(cfg["queue_tab"], rows=1000, cols=12)
-            _, header = prepare_queue_tab(ws)
+            _, header = sheets_retry(lambda: prepare_queue_tab(ws), "preparing the queue tab")
     else:
         log("no SHEET_ID / GOOGLE_SERVICE_ACCOUNT_JSON set - cannot de-duplicate or suppress against your sheet.")
         if not dry_run:
@@ -1156,8 +1241,8 @@ def run(dry_run, combos_per_run, max_new):
     log(f"new leads with a deliverable on-site email: {len(rows)} (Pending: {pending}); crawled {crawled} sites; "
         f"google requests used: {budget.used}")
     if rows and ws is not None and not dry_run:
-        ws.append_rows(rows, value_input_option="RAW")
-        log(f"appended {len(rows)} rows to '{cfg['queue_tab']}'")
+        added = append_new_rows(ws, rows, header)
+        log(f"appended {added} rows to '{cfg['queue_tab']}'")
     if not dry_run:
         state["cursor"] = next_cursor
         state["retry"] = failed

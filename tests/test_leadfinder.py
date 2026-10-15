@@ -48,6 +48,10 @@ class FakeWS:
 
 
 class Tests(unittest.TestCase):
+    def setUp(self):
+        lf._reset_overpass_state()  # mirror cooldowns from one test must not leak into the next
+        lf._overpass_deadline = None  # nor a time budget left over from a test that ran the whole pipeline
+
     def test_norm_name(self):
         self.assertEqual(lf.norm_name("S&O Conversions Ltd"), lf.norm_name("S and O Conversions Limited"))
         self.assertEqual(lf.norm_name("The Blue Fox Plumbing"), "bluefoxplumbing")
@@ -144,17 +148,17 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(set(calls)), 3)  # each attempt hit a different mirror
         self.assertEqual([c.args[0] for c in sl.call_args_list], [2, 4])  # exponential backoff
 
-    def test_overpass_gives_up_after_first_try_plus_two_retries(self):
+    def test_overpass_tries_every_mirror_once_then_gives_up(self):
         calls = []
 
         class S:
             def post(_, url, **k):
-                calls.append(k["timeout"])
+                calls.append((url, k["timeout"]))
                 raise lf.requests.ConnectionError("x")
         with mock.patch("time.sleep"):
             self.assertIsNone(lf.overpass_query("q", S()))
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[0], (5, 25))  # each attempt capped at ~25s read
+        self.assertEqual([u for u, _ in calls], lf.OVERPASS_URLS)  # each mirror tried once, in order
+        self.assertEqual(calls[0][1], lf.OVERPASS_REQUEST_TIMEOUT)  # each attempt capped by the read timeout
 
     def test_overpass_skips_when_time_budget_used_up(self):
         class S:
@@ -162,6 +166,185 @@ class Tests(unittest.TestCase):
                 raise AssertionError("must not be called")
         with mock.patch.object(lf, "_overpass_deadline", 0):
             self.assertIsNone(lf.overpass_query("q", S()))
+
+    def test_overpass_has_the_mail_ru_mirror_and_it_is_tried_before_the_flaky_ones(self):
+        hosts = [lf.host_of(u) for u in lf.OVERPASS_URLS]
+        self.assertIn("maps.mail.ru", hosts)
+        self.assertLess(hosts.index("maps.mail.ru"), hosts.index("overpass.kumi.systems"))
+
+    def test_overpass_failed_mirror_sits_out_then_gets_another_chance(self):
+        now = [1000.0]
+        calls = []
+        down = {lf.OVERPASS_URLS[0]}  # only the first mirror is down
+
+        class S:
+            def post(_, url, **k):
+                calls.append(url)
+                r = FakeResp()
+                if url in down:
+                    r.status_code = 504
+                else:
+                    r.json = lambda: {"elements": []}
+                return r
+        with mock.patch("time.monotonic", lambda: now[0]), mock.patch("time.sleep"):
+            self.assertEqual(lf.overpass_query("q", S()), {"elements": []})
+            self.assertEqual(calls, lf.OVERPASS_URLS[:2])        # first failed, second answered
+            calls.clear()
+            self.assertEqual(lf.overpass_query("q", S()), {"elements": []})
+            self.assertEqual(calls, [lf.OVERPASS_URLS[1]])        # failed mirror is skipped while cooling down
+            calls.clear()
+            now[0] += lf.OVERPASS_COOLDOWN_STEP + 1               # cooldown over
+            down.clear()                                          # ...and it has recovered
+            self.assertEqual(lf.overpass_query("q", S()), {"elements": []})
+            self.assertEqual(calls, [lf.OVERPASS_URLS[0]])        # tried first again
+
+    def test_overpass_runtime_error_remark_is_a_failure_not_zero_results(self):
+        calls = []
+
+        class S:
+            def post(_, url, **k):
+                calls.append(url)
+                r = FakeResp()
+                if len(calls) == 1:
+                    r.json = lambda: {"elements": [], "remark": "runtime error: Query timed out in \"query\" at line 1"}
+                else:
+                    r.json = lambda: {"elements": [{"type": "node"}]}
+                return r
+        with mock.patch("time.sleep"):
+            data = lf.overpass_query("q", S())
+        self.assertEqual(data, {"elements": [{"type": "node"}]})
+        self.assertEqual(len(calls), 2)  # the "empty" 200 was retried on the next mirror
+
+    def test_overpass_waits_for_a_mirror_when_all_are_cooling_down(self):
+        now = [0.0]
+        calls = []
+
+        def fake_sleep(sec):
+            now[0] += sec
+
+        class S:
+            def post(_, url, **k):
+                calls.append(url)
+                r = FakeResp()
+                if len(calls) <= len(lf.OVERPASS_URLS):
+                    r.status_code = 503  # everything down on the first pass
+                else:
+                    r.json = lambda: {"elements": []}
+                return r
+        with mock.patch("time.monotonic", lambda: now[0]), mock.patch("time.sleep", fake_sleep):
+            data = lf.overpass_query("q", S())
+        self.assertEqual(data, {"elements": []})
+        self.assertGreater(now[0], lf.OVERPASS_COOLDOWN_STEP - 1)   # it really waited for the cooldown
+        self.assertLessEqual(now[0], 120)                           # ...but not unreasonably long
+
+    def test_overpass_all_down_does_not_wait_forever(self):
+        slept = []
+
+        class S:
+            def post(_, url, **k):
+                raise lf.requests.ConnectionError("x")
+        with mock.patch("time.sleep", slept.append):  # the clock never advances, so cooldowns never end
+            self.assertIsNone(lf.overpass_query("q", S()))
+        self.assertLessEqual(len(slept), lf.OVERPASS_ATTEMPTS + lf.OVERPASS_MAX_WAITS)
+        self.assertTrue(all(s <= lf.OVERPASS_MAX_WAIT_SECONDS for s in slept))
+
+    def test_overpass_cooldown_waits_stay_inside_the_run_budget(self):
+        now = [100.0]
+
+        class S:
+            def post(_, url, **k):
+                raise lf.requests.ConnectionError("x")
+        with mock.patch("time.monotonic", lambda: now[0]), \
+                mock.patch("time.sleep", lambda sec: now.__setitem__(0, now[0] + sec)), \
+                mock.patch.object(lf, "_overpass_deadline", 100.0 + 30):
+            self.assertIsNone(lf.overpass_query("q", S()))
+        self.assertLessEqual(now[0], 100.0 + 30 + lf.OVERPASS_BACKOFF_CAP)  # never sleeps past the budget
+
+    def _sheet_ws(self, first_error, applied_before_error):
+        header = ["Business Name", "Contact Email"]
+        outer = self
+
+        class WS:
+            def __init__(self):
+                self.rows = []
+                self.calls = 0
+
+            def append_rows(self, rows, value_input_option=None):
+                self.calls += 1
+                if self.calls == 1 and first_error is not None:
+                    if applied_before_error:
+                        self.rows.extend(rows)
+                    raise first_error
+                self.rows.extend(rows)
+
+            def get_all_values(self):
+                return [header] + self.rows
+        return header, WS()
+
+    def test_append_retries_a_dropped_connection_without_duplicating_rows(self):
+        err = lf.requests.exceptions.ConnectionError("Remote end closed connection without response")
+        rows = [["A Ltd", "a@a.co.uk"], ["B Ltd", "b@b.co.uk"]]
+        # the write never reached Google: retry sends everything
+        header, ws = self._sheet_ws(err, applied_before_error=False)
+        with mock.patch("time.sleep"):
+            self.assertEqual(lf.append_new_rows(ws, rows, header), 2)
+        self.assertEqual(ws.rows, rows)
+        # Google applied the write but the answer was lost: retry must not add them again
+        header, ws = self._sheet_ws(err, applied_before_error=True)
+        with mock.patch("time.sleep"):
+            self.assertEqual(lf.append_new_rows(ws, rows, header), 0)
+        self.assertEqual(ws.rows, rows)
+
+    def test_append_does_not_retry_a_real_error(self):
+        header, ws = self._sheet_ws(ValueError("bad data"), applied_before_error=False)
+        with mock.patch("time.sleep") as sl, self.assertRaises(ValueError):
+            lf.append_new_rows(ws, [["A", "a@a.co.uk"]], header)
+        self.assertEqual(ws.calls, 1)
+        sl.assert_not_called()
+
+    def test_append_gives_up_after_the_last_attempt(self):
+        err = lf.requests.exceptions.ConnectionError("down")
+
+        class WS:
+            calls = 0
+
+            def append_rows(self, rows, value_input_option=None):
+                WS.calls += 1
+                raise err
+
+            def get_all_values(self):
+                return [["Business Name", "Contact Email"]]
+        with mock.patch("time.sleep"), self.assertRaises(lf.requests.exceptions.ConnectionError):
+            lf.append_new_rows(WS(), [["A", "a@a.co.uk"]], ["Business Name", "Contact Email"])
+        self.assertEqual(WS.calls, lf.SHEETS_ATTEMPTS)
+
+    def test_sheets_retry_backs_off_on_transient_errors_only(self):
+        n = []
+
+        def flaky():
+            n.append(1)
+            if len(n) < 3:
+                raise lf.requests.exceptions.ReadTimeout("slow")
+            return "ok"
+        with mock.patch("time.sleep") as sl:
+            self.assertEqual(lf.sheets_retry(flaky, "x"), "ok")
+        self.assertEqual([c.args[0] for c in sl.call_args_list], [lf.SHEETS_BACKOFF, lf.SHEETS_BACKOFF * 2])
+        with mock.patch("time.sleep"), self.assertRaises(KeyError):
+            lf.sheets_retry(lambda: {}["missing"], "x")
+
+    def test_sheets_retry_treats_google_5xx_and_429_as_transient_but_not_403(self):
+        import gspread
+
+        def api_error(code):
+            class R:
+                status_code = code
+                text = "x"
+
+                def json(_):
+                    return {"error": {"code": code, "message": "m", "status": "S"}}
+            return gspread.exceptions.APIError(R())
+        for code, transient in ((503, True), (429, True), (500, True), (403, False), (404, False)):
+            self.assertEqual(lf._sheets_transient(api_error(code)), transient, code)
 
     def test_failed_search_returns_none_not_empty(self):
         trade = {"label": "Plumber", "osm": [["craft", "plumber"]]}

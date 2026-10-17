@@ -1106,5 +1106,65 @@ class LocalExtractTests(unittest.TestCase):
         self.assertEqual(seen["towns"], ["Crewe"])
 
 
+    def test_bilingual_place_names_are_found_under_either_name(self):
+        lat, lon = 52.08, -4.66
+        ex = self._extract([self._town("Aberteifi / Cardigan", "town", (lat, lon))], [_biz("n1", lat, lon, craft="plumber")])
+        trade = {"label": "P", "osm": [["craft", "plumber"]]}
+        for name in ("Cardigan", "aberteifi", "Aberteifi / Cardigan"):
+            self.assertEqual(self._ids(ex.search([trade], name)), ["n1"], name)
+        self.assertEqual(ex.town_names(), ["Aberteifi / Cardigan"])
+
+    def test_expand_towns_does_not_add_a_bilingual_town_that_is_already_listed(self):
+        ex = self._extract([self._town("Aberteifi / Cardigan", "town", (52.08, -4.66)), self._town("Crewe")],
+                           [_biz("n1", *self.CREWE, craft="plumber")])
+        self.assertEqual(lf.expand_towns(["Cardigan"], ex), ["Cardigan", "Crewe"])
+
+    def _batch_with_failing_overpass(self, towns):
+        lf._local_extract = self._extract([self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        trades = [{"label": "Plumber", "osm": [["craft", "plumber"]]}]
+        with mock.patch.object(lf, "overpass_query", return_value=None) as q, mock.patch.object(lf.time, "sleep"), \
+                mock.patch.object(lf, "log"):
+            results = [lf.overpass_leads_batch(trades, t, None) for t in towns]
+        return results, q
+
+    def test_a_town_missing_from_the_map_data_is_skipped_not_retried_when_overpass_is_down(self):
+        results, q = self._batch_with_failing_overpass(["Belfast"])
+        self.assertEqual(results, [{"Plumber": []}])  # an empty result, not None, so no retry is queued
+        q.assert_called_once()
+
+    def test_overpass_is_only_tried_once_per_run_after_it_fails_for_a_missing_town(self):
+        results, q = self._batch_with_failing_overpass(["Belfast", "Derry", "Armagh"])
+        self.assertEqual(results, [{"Plumber": []}] * 3)
+        q.assert_called_once()  # the other two did not wait for a dead server
+        lf._reset_overpass_state()  # ...but the next run asks again
+        with mock.patch.object(lf, "overpass_query", return_value={"elements": []}) as q2, mock.patch.object(lf.time, "sleep"):
+            self.assertEqual(lf.overpass_leads_batch([{"label": "Plumber", "osm": [["craft", "plumber"]]}], "Derry", None),
+                             {"Plumber": []})
+        q2.assert_called_once()
+
+    def test_towns_in_the_map_data_still_work_after_overpass_has_failed(self):
+        lf._local_extract = self._extract([self._town()], [_biz("n1", *self.CREWE, craft="plumber", name="Pipe Dream")])
+        lf._overpass_fallback_down = True
+        trades = [{"label": "Plumber", "osm": [["craft", "plumber"]]}]
+        with mock.patch.object(lf, "overpass_query", side_effect=AssertionError("not needed")):
+            result = lf.overpass_leads_batch(trades, "Crewe", None)
+        self.assertEqual([l.name for l in result["Plumber"]], ["Pipe Dream"])
+
+    def test_with_the_map_data_overpass_only_gets_a_short_time_budget(self):
+        _write_extract(self.dir, [self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        cfg = {"trades": [], "towns": [], "queue_tab": "q", "tracker_tab": "t"}
+        quiet = {"COMPANIES_HOUSE_API_KEY": "", "GOOGLE_PLACES_API_KEY": "", "SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": "",
+                 "OVERPASS_BUDGET_SECONDS": "780"}
+        deadlines = []
+        for directory in (self.dir, os.path.join(self.dir, "nope")):
+            with mock.patch.object(lf, "LOCAL_EXTRACT_DIR", directory), mock.patch.object(lf, "load_config", return_value=cfg), \
+                    mock.patch.object(lf, "log"), mock.patch.object(lf, "pick_with_retries", return_value=([], 0)), \
+                    mock.patch.object(lf, "load_state", return_value={}), mock.patch.object(lf.time, "monotonic", return_value=1000.0), \
+                    mock.patch.dict(os.environ, quiet):
+                lf.run(True, 1, 10)
+            deadlines.append(lf._overpass_deadline)
+        self.assertEqual(deadlines, [1000.0 + lf.OVERPASS_FALLBACK_SECONDS, 1000.0 + 780])
+
+
 if __name__ == "__main__":
     unittest.main()

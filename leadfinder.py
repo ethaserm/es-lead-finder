@@ -60,6 +60,7 @@ OVERPASS_COOLDOWN_STEP = 45   # a mirror that fails sits out this long per failu
 OVERPASS_COOLDOWN_CAP = 180   # ...up to this many seconds, then it is tried again (it may have recovered)
 OVERPASS_MAX_WAITS = 2        # times one query may wait for a cooling-down mirror when every mirror is out
 OVERPASS_MAX_WAIT_SECONDS = 60
+OVERPASS_FALLBACK_SECONDS = 120  # with the map data loaded Overpass is only a side road: stop waiting for it after this long
 SHEETS_ATTEMPTS = 4           # tries for a Google Sheets call that hits a network blip / 5xx / 429
 SHEETS_BACKOFF = 5            # seconds; doubles each retry
 CH_GRACE_SECONDS = 90         # extra time after the crawl budget for Companies House checks
@@ -69,6 +70,7 @@ LOCAL_CITY_RADIUS_M = 6000   # the local search has no boundaries, so a city (bi
 LOCAL_EXTRACT_STALE_DAYS = 45
 _local_extract = None            # LocalExtract once load_local_extract() found one; None = use Overpass
 _overpass_deadline = None     # time.monotonic() after which Overpass searches are skipped
+_overpass_fallback_down = False  # with the map data loaded: Overpass already failed once this run, so stop asking it
 _overpass_fail_counts = {}    # host -> failures in a row (reset by a success)
 _overpass_cooldown_until = {}  # host -> time.monotonic() before which the mirror sits out
 
@@ -237,8 +239,10 @@ class Lead:
 
 # --------------------------------------------------------------------------- source 1: OpenStreetMap
 def _reset_overpass_state():
+    global _overpass_fallback_down
     _overpass_fail_counts.clear()
     _overpass_cooldown_until.clear()
+    _overpass_fallback_down = False
 
 
 def _next_overpass_mirror(now):
@@ -315,6 +319,16 @@ def overpass_query(query, session):
 
 
 # --------------------------------------------------------------------------- source 1a: local OSM extract
+def place_keys(name):
+    """Lower-case lookup keys for a place name. Welsh and Scottish places are often written 'Aberteifi / Cardigan',
+    which should be found under either name as well as the whole thing."""
+    keys = []
+    for k in [(name or "").strip().casefold()] + [p.strip().casefold() for p in re.split(r"[/;]", name or "")]:
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
 class LocalExtract:
     """Businesses and towns from a Geofabrik Great Britain download (see tools/build_osm_extract.py).
 
@@ -328,9 +342,13 @@ class LocalExtract:
     def __init__(self, places, trades, meta=None):
         self.meta = meta or {}
         self.places = {}  # lower-case name -> [(lat, lon, place_type)]
+        self._place_names = {}  # lower-case name -> (name as written, is_city)
         for pl in places:
-            self.places.setdefault(pl["name"].strip().casefold(), []).append(
-                (pl["lat"], pl["lon"], pl.get("place", "town")))
+            keys = place_keys(pl["name"])
+            for k in keys:
+                self.places.setdefault(k, []).append((pl["lat"], pl["lon"], pl.get("place", "town")))
+            written, was_city = self._place_names.get(keys[0], (pl["name"].strip(), False))
+            self._place_names[keys[0]] = (written, was_city or pl.get("place") == "city")
         self.count = 0
         self.grid = {}  # (key, value) -> {(cell_lat, cell_lon): [record, ...]}
         for rec in trades:
@@ -341,6 +359,10 @@ class LocalExtract:
                 if k in tags:
                     self.grid.setdefault((k, tags[k]), {}).setdefault(cell, []).append(rec)
             self.count += 1
+
+    def town_names(self):
+        """Every distinct city / town name in the map data: cities first, then towns, A to Z."""
+        return [name for name, _ in sorted(self._place_names.values(), key=lambda v: (not v[1], v[0].casefold()))]
 
     def find_places(self, name):
         return self.places.get((name or "").strip().casefold(), [])
@@ -454,6 +476,20 @@ def load_local_extract(directory=None):
     return extract
 
 
+def expand_towns(towns, extract):
+    """The towns from config.json followed by every other city / town in the map data.
+
+    config.json keeps its order at the front, so the rotation position saved in state.json still points
+    at the same place; the extra towns are appended after it. A name already in config.json (as its
+    name or its "osm" name) is not added a second time."""
+    known = set()
+    for t in towns:
+        for n in ((t.get("name"), t.get("osm")) if isinstance(t, dict) else (t,)):
+            if n:
+                known.add(n.strip().casefold())
+    return list(towns) + [n for n in extract.town_names() if not any(k in known for k in place_keys(n))]
+
+
 def _parse_overpass_elements(data, town):
     """Shared element parsing: UK filter, dedupe, and the raw fields every Lead needs."""
     label = town["name"] if isinstance(town, dict) else town
@@ -498,8 +534,14 @@ def overpass_leads_batch(trades, town, session):
     result = {t["label"]: [] for t in trades}
     if not have_tags:
         return result  # none of these trades search OSM (e.g. Google-Places-only trades)
+    global _overpass_fallback_down
     data = _local_extract.search(trades, town) if _local_extract is not None else None
     if data is None:  # no local extract, or the town is not in it: ask Overpass
+        if _local_extract is not None and _overpass_fallback_down:
+            # Overpass already failed for a town that is not in the map data (e.g. Northern Ireland) in this run.
+            # Don't keep waiting for it, and don't queue a retry: the town comes round again on the next pass.
+            log("    not in the map data and Overpass is down - skipped until the next pass")
+            return result
         query = (
             f'[out:json][timeout:{OVERPASS_SERVER_TIMEOUT}];'
             f'rel["name"="{area_name}"]["boundary"="administrative"]({bbox});map_to_area->.a;'
@@ -509,6 +551,10 @@ def overpass_leads_batch(trades, town, session):
         data = overpass_query(query, session)
         time.sleep(OVERPASS_QUERY_DELAY)  # stay well inside the public servers' fair-use limits
         if data is None:
+            if _local_extract is not None:
+                _overpass_fallback_down = True
+                log("    not in the map data and Overpass is down - skipped until the next pass")
+                return result
             return None  # search failed; caller records it for a retry on a later run
     for tags, name, website, phone, addr, emails, label in _parse_overpass_elements(data, town):
         for trade in trades:
@@ -1224,9 +1270,18 @@ def run(dry_run, combos_per_run, max_new):
     started = time.monotonic()
     _overpass_deadline = started + env_int("OVERPASS_BUDGET_SECONDS", 240)
     _reset_overpass_state()
-    load_local_extract()
+    extract = load_local_extract()
+    if extract is not None:
+        _overpass_deadline = min(_overpass_deadline, started + env_int("OVERPASS_FALLBACK_SECONDS", OVERPASS_FALLBACK_SECONDS))
     run_deadline = started + env_int("RUN_BUDGET_SECONDS", 380)
     cfg = load_config()
+    if extract is not None and env_flag("WHOLE_COUNTRY", True):
+        # Searching the map data costs nothing, so look at every city and town in Great Britain, not just
+        # the ones listed in config.json.
+        listed = len(cfg["towns"])
+        cfg["towns"] = expand_towns(cfg["towns"], extract)
+        log(f"towns to search: {len(cfg['towns'])} ({listed} from config.json + {len(cfg['towns']) - listed} "
+            f"more from the map data)")
     session = requests.Session()
     google_key = clean_secret(os.environ.get("GOOGLE_PLACES_API_KEY"))
     ch_key = clean_secret(os.environ.get("COMPANIES_HOUSE_API_KEY"))

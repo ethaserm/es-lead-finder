@@ -77,7 +77,7 @@ jobs:
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
           COMPANIES_HOUSE_API_KEY: ${{ secrets.COMPANIES_HOUSE_API_KEY }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          COMBOS_PER_RUN: "350"
+          COMBOS_PER_RUN: "700"
           OVERPASS_BUDGET_SECONDS: "780"
           RUN_BUDGET_SECONDS: "1020"
           MAX_SITES_PER_RUN: "800"

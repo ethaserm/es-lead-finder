@@ -418,7 +418,7 @@ class Tests(unittest.TestCase):
         self.assertRegex(cron[0], r"^\d+$")  # one fixed minute, not top of the hour
         self.assertNotEqual(cron[0], "0")
         env = {k: int(v) for k, v in re.findall(r'^\s+([A-Z_]+):\s*"(\d+)"', text, re.M)}
-        self.assertEqual(env["COMBOS_PER_RUN"], 350)
+        self.assertEqual(env["COMBOS_PER_RUN"], 700)
         self.assertGreaterEqual(env["MAX_NEW_PER_RUN"], 500)
         self.assertGreaterEqual(env["MAX_SITES_PER_RUN"], 400)
         timeout = int(re.search(r"timeout-minutes:\s*(\d+)", text).group(1)) * 60
@@ -1047,6 +1047,123 @@ class LocalExtractTests(unittest.TestCase):
                                              "SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": ""}):
             lf.run(True, 1, 10)
         self.assertIn("local OSM extract: 1 businesses", _logged(lg))
+
+
+    def _towns_extract(self):
+        places = [self._town("Nantwich", "town", (53.067, -2.522)), self._town("Chester", "city", (53.19, -2.89)),
+                  self._town("Crewe", "town", self.CREWE), self._town("Kingston upon Hull", "city", (53.74, -0.33)),
+                  self._town("Newport", "town", (50.70, -1.29)), self._town("Newport", "city", (51.58, -3.00)),
+                  self._town("Alsager", "town", (53.096, -2.305))]
+        return self._extract(places, [_biz("n1", *self.CREWE, craft="plumber")])
+
+    def test_town_names_lists_cities_first_without_duplicates(self):
+        self.assertEqual(self._towns_extract().town_names(),
+                         ["Chester", "Kingston upon Hull", "Newport", "Alsager", "Crewe", "Nantwich"])
+
+    def test_expand_towns_keeps_the_config_order_and_adds_the_rest(self):
+        ex = self._towns_extract()
+        config_towns = ["Crewe", {"name": "Hull", "osm": "kingston UPON hull"}, "Belfast", "chester"]
+        out = lf.expand_towns(config_towns, ex)
+        self.assertEqual(out[:4], config_towns)  # same order, so the saved rotation position still fits
+        self.assertEqual(out[4:], ["Newport", "Alsager", "Nantwich"])  # nothing listed twice
+
+    def _run_logging_picks(self, towns, env=None):
+        _write_extract(self.dir, [self._town("Chester", "city", (53.19, -2.89)), self._town("Crewe", "town", self.CREWE),
+                                  self._town("Nantwich", "town", (53.067, -2.522))],
+                       [_biz("n1", *self.CREWE, craft="plumber")])
+        seen = {}
+
+        def picks(cfg, state, count):
+            seen["towns"] = list(cfg["towns"])
+            return [], 0
+        cfg = {"trades": [], "towns": towns, "queue_tab": "q", "tracker_tab": "t"}
+        quiet = {"COMPANIES_HOUSE_API_KEY": "", "GOOGLE_PLACES_API_KEY": "", "SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": ""}
+        with mock.patch.object(lf, "LOCAL_EXTRACT_DIR", self.dir), mock.patch.object(lf, "load_config", return_value=cfg), \
+                mock.patch.object(lf, "log") as lg, mock.patch.object(lf, "pick_with_retries", side_effect=picks), \
+                mock.patch.object(lf, "load_state", return_value={}), mock.patch.dict(os.environ, dict(quiet, **(env or {}))):
+            lf.run(True, 1, 10)
+        return seen["towns"], _logged(lg)
+
+    def test_run_searches_every_town_in_the_map_data(self):
+        towns, logged = self._run_logging_picks(["Crewe"])
+        self.assertEqual(towns, ["Crewe", "Chester", "Nantwich"])
+        self.assertIn("towns to search: 3 (1 from config.json + 2 more from the map data)", logged)
+
+    def test_whole_country_search_can_be_switched_off(self):
+        towns, logged = self._run_logging_picks(["Crewe"], env={"WHOLE_COUNTRY": "0"})
+        self.assertEqual(towns, ["Crewe"])
+        self.assertNotIn("towns to search", logged)
+
+    def test_without_the_map_data_only_the_configured_towns_are_searched(self):
+        cfg = {"trades": [], "towns": ["Crewe"], "queue_tab": "q", "tracker_tab": "t"}
+        seen = {}
+        with mock.patch.object(lf, "load_config", return_value=cfg), mock.patch.object(lf, "log"), \
+                mock.patch.object(lf, "pick_with_retries", side_effect=lambda c, st, n: (seen.update(towns=list(c["towns"])) or [], 0)), \
+                mock.patch.object(lf, "load_state", return_value={}), \
+                mock.patch.dict(os.environ, {"COMPANIES_HOUSE_API_KEY": "", "GOOGLE_PLACES_API_KEY": "", "SHEET_ID": "",
+                                             "GOOGLE_SERVICE_ACCOUNT_JSON": ""}):
+            lf.run(True, 1, 10)  # LOCAL_EXTRACT_DIR is the empty temp path from the base class
+        self.assertEqual(seen["towns"], ["Crewe"])
+
+
+    def test_bilingual_place_names_are_found_under_either_name(self):
+        lat, lon = 52.08, -4.66
+        ex = self._extract([self._town("Aberteifi / Cardigan", "town", (lat, lon))], [_biz("n1", lat, lon, craft="plumber")])
+        trade = {"label": "P", "osm": [["craft", "plumber"]]}
+        for name in ("Cardigan", "aberteifi", "Aberteifi / Cardigan"):
+            self.assertEqual(self._ids(ex.search([trade], name)), ["n1"], name)
+        self.assertEqual(ex.town_names(), ["Aberteifi / Cardigan"])
+
+    def test_expand_towns_does_not_add_a_bilingual_town_that_is_already_listed(self):
+        ex = self._extract([self._town("Aberteifi / Cardigan", "town", (52.08, -4.66)), self._town("Crewe")],
+                           [_biz("n1", *self.CREWE, craft="plumber")])
+        self.assertEqual(lf.expand_towns(["Cardigan"], ex), ["Cardigan", "Crewe"])
+
+    def _batch_with_failing_overpass(self, towns):
+        lf._local_extract = self._extract([self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        trades = [{"label": "Plumber", "osm": [["craft", "plumber"]]}]
+        with mock.patch.object(lf, "overpass_query", return_value=None) as q, mock.patch.object(lf.time, "sleep"), \
+                mock.patch.object(lf, "log"):
+            results = [lf.overpass_leads_batch(trades, t, None) for t in towns]
+        return results, q
+
+    def test_a_town_missing_from_the_map_data_is_skipped_not_retried_when_overpass_is_down(self):
+        results, q = self._batch_with_failing_overpass(["Belfast"])
+        self.assertEqual(results, [{"Plumber": []}])  # an empty result, not None, so no retry is queued
+        q.assert_called_once()
+
+    def test_overpass_is_only_tried_once_per_run_after_it_fails_for_a_missing_town(self):
+        results, q = self._batch_with_failing_overpass(["Belfast", "Derry", "Armagh"])
+        self.assertEqual(results, [{"Plumber": []}] * 3)
+        q.assert_called_once()  # the other two did not wait for a dead server
+        lf._reset_overpass_state()  # ...but the next run asks again
+        with mock.patch.object(lf, "overpass_query", return_value={"elements": []}) as q2, mock.patch.object(lf.time, "sleep"):
+            self.assertEqual(lf.overpass_leads_batch([{"label": "Plumber", "osm": [["craft", "plumber"]]}], "Derry", None),
+                             {"Plumber": []})
+        q2.assert_called_once()
+
+    def test_towns_in_the_map_data_still_work_after_overpass_has_failed(self):
+        lf._local_extract = self._extract([self._town()], [_biz("n1", *self.CREWE, craft="plumber", name="Pipe Dream")])
+        lf._overpass_fallback_down = True
+        trades = [{"label": "Plumber", "osm": [["craft", "plumber"]]}]
+        with mock.patch.object(lf, "overpass_query", side_effect=AssertionError("not needed")):
+            result = lf.overpass_leads_batch(trades, "Crewe", None)
+        self.assertEqual([l.name for l in result["Plumber"]], ["Pipe Dream"])
+
+    def test_with_the_map_data_overpass_only_gets_a_short_time_budget(self):
+        _write_extract(self.dir, [self._town()], [_biz("n1", *self.CREWE, craft="plumber")])
+        cfg = {"trades": [], "towns": [], "queue_tab": "q", "tracker_tab": "t"}
+        quiet = {"COMPANIES_HOUSE_API_KEY": "", "GOOGLE_PLACES_API_KEY": "", "SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": "",
+                 "OVERPASS_BUDGET_SECONDS": "780"}
+        deadlines = []
+        for directory in (self.dir, os.path.join(self.dir, "nope")):
+            with mock.patch.object(lf, "LOCAL_EXTRACT_DIR", directory), mock.patch.object(lf, "load_config", return_value=cfg), \
+                    mock.patch.object(lf, "log"), mock.patch.object(lf, "pick_with_retries", return_value=([], 0)), \
+                    mock.patch.object(lf, "load_state", return_value={}), mock.patch.object(lf.time, "monotonic", return_value=1000.0), \
+                    mock.patch.dict(os.environ, quiet):
+                lf.run(True, 1, 10)
+            deadlines.append(lf._overpass_deadline)
+        self.assertEqual(deadlines, [1000.0 + lf.OVERPASS_FALLBACK_SECONDS, 1000.0 + 780])
 
 
 if __name__ == "__main__":

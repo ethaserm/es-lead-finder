@@ -328,9 +328,12 @@ class LocalExtract:
     def __init__(self, places, trades, meta=None):
         self.meta = meta or {}
         self.places = {}  # lower-case name -> [(lat, lon, place_type)]
+        self._place_names = {}  # lower-case name -> (name as written, is_city)
         for pl in places:
-            self.places.setdefault(pl["name"].strip().casefold(), []).append(
-                (pl["lat"], pl["lon"], pl.get("place", "town")))
+            key = pl["name"].strip().casefold()
+            self.places.setdefault(key, []).append((pl["lat"], pl["lon"], pl.get("place", "town")))
+            written, was_city = self._place_names.get(key, (pl["name"].strip(), False))
+            self._place_names[key] = (written, was_city or pl.get("place") == "city")
         self.count = 0
         self.grid = {}  # (key, value) -> {(cell_lat, cell_lon): [record, ...]}
         for rec in trades:
@@ -341,6 +344,10 @@ class LocalExtract:
                 if k in tags:
                     self.grid.setdefault((k, tags[k]), {}).setdefault(cell, []).append(rec)
             self.count += 1
+
+    def town_names(self):
+        """Every distinct city / town name in the map data: cities first, then towns, A to Z."""
+        return [name for name, _ in sorted(self._place_names.values(), key=lambda v: (not v[1], v[0].casefold()))]
 
     def find_places(self, name):
         return self.places.get((name or "").strip().casefold(), [])
@@ -452,6 +459,20 @@ def load_local_extract(directory=None):
     log(f"local OSM extract: {extract.count} businesses, {len(places)} towns, built {built or 'unknown'}{note}")
     _local_extract = extract
     return extract
+
+
+def expand_towns(towns, extract):
+    """The towns from config.json followed by every other city / town in the map data.
+
+    config.json keeps its order at the front, so the rotation position saved in state.json still points
+    at the same place; the extra towns are appended after it. A name already in config.json (as its
+    name or its "osm" name) is not added a second time."""
+    known = set()
+    for t in towns:
+        for n in ((t.get("name"), t.get("osm")) if isinstance(t, dict) else (t,)):
+            if n:
+                known.add(n.strip().casefold())
+    return list(towns) + [n for n in extract.town_names() if n.strip().casefold() not in known]
 
 
 def _parse_overpass_elements(data, town):
@@ -1224,9 +1245,16 @@ def run(dry_run, combos_per_run, max_new):
     started = time.monotonic()
     _overpass_deadline = started + env_int("OVERPASS_BUDGET_SECONDS", 240)
     _reset_overpass_state()
-    load_local_extract()
+    extract = load_local_extract()
     run_deadline = started + env_int("RUN_BUDGET_SECONDS", 380)
     cfg = load_config()
+    if extract is not None and env_flag("WHOLE_COUNTRY", True):
+        # Searching the map data costs nothing, so look at every city and town in Great Britain, not just
+        # the ones listed in config.json.
+        listed = len(cfg["towns"])
+        cfg["towns"] = expand_towns(cfg["towns"], extract)
+        log(f"towns to search: {len(cfg['towns'])} ({listed} from config.json + {len(cfg['towns']) - listed} "
+            f"more from the map data)")
     session = requests.Session()
     google_key = clean_secret(os.environ.get("GOOGLE_PLACES_API_KEY"))
     ch_key = clean_secret(os.environ.get("COMPANIES_HOUSE_API_KEY"))

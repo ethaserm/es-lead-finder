@@ -418,7 +418,7 @@ class Tests(unittest.TestCase):
         self.assertRegex(cron[0], r"^\d+$")  # one fixed minute, not top of the hour
         self.assertNotEqual(cron[0], "0")
         env = {k: int(v) for k, v in re.findall(r'^\s+([A-Z_]+):\s*"(\d+)"', text, re.M)}
-        self.assertEqual(env["COMBOS_PER_RUN"], 350)
+        self.assertEqual(env["COMBOS_PER_RUN"], 700)
         self.assertGreaterEqual(env["MAX_NEW_PER_RUN"], 500)
         self.assertGreaterEqual(env["MAX_SITES_PER_RUN"], 400)
         timeout = int(re.search(r"timeout-minutes:\s*(\d+)", text).group(1)) * 60
@@ -1047,6 +1047,63 @@ class LocalExtractTests(unittest.TestCase):
                                              "SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": ""}):
             lf.run(True, 1, 10)
         self.assertIn("local OSM extract: 1 businesses", _logged(lg))
+
+
+    def _towns_extract(self):
+        places = [self._town("Nantwich", "town", (53.067, -2.522)), self._town("Chester", "city", (53.19, -2.89)),
+                  self._town("Crewe", "town", self.CREWE), self._town("Kingston upon Hull", "city", (53.74, -0.33)),
+                  self._town("Newport", "town", (50.70, -1.29)), self._town("Newport", "city", (51.58, -3.00)),
+                  self._town("Alsager", "town", (53.096, -2.305))]
+        return self._extract(places, [_biz("n1", *self.CREWE, craft="plumber")])
+
+    def test_town_names_lists_cities_first_without_duplicates(self):
+        self.assertEqual(self._towns_extract().town_names(),
+                         ["Chester", "Kingston upon Hull", "Newport", "Alsager", "Crewe", "Nantwich"])
+
+    def test_expand_towns_keeps_the_config_order_and_adds_the_rest(self):
+        ex = self._towns_extract()
+        config_towns = ["Crewe", {"name": "Hull", "osm": "kingston UPON hull"}, "Belfast", "chester"]
+        out = lf.expand_towns(config_towns, ex)
+        self.assertEqual(out[:4], config_towns)  # same order, so the saved rotation position still fits
+        self.assertEqual(out[4:], ["Newport", "Alsager", "Nantwich"])  # nothing listed twice
+
+    def _run_logging_picks(self, towns, env=None):
+        _write_extract(self.dir, [self._town("Chester", "city", (53.19, -2.89)), self._town("Crewe", "town", self.CREWE),
+                                  self._town("Nantwich", "town", (53.067, -2.522))],
+                       [_biz("n1", *self.CREWE, craft="plumber")])
+        seen = {}
+
+        def picks(cfg, state, count):
+            seen["towns"] = list(cfg["towns"])
+            return [], 0
+        cfg = {"trades": [], "towns": towns, "queue_tab": "q", "tracker_tab": "t"}
+        quiet = {"COMPANIES_HOUSE_API_KEY": "", "GOOGLE_PLACES_API_KEY": "", "SHEET_ID": "", "GOOGLE_SERVICE_ACCOUNT_JSON": ""}
+        with mock.patch.object(lf, "LOCAL_EXTRACT_DIR", self.dir), mock.patch.object(lf, "load_config", return_value=cfg), \
+                mock.patch.object(lf, "log") as lg, mock.patch.object(lf, "pick_with_retries", side_effect=picks), \
+                mock.patch.object(lf, "load_state", return_value={}), mock.patch.dict(os.environ, dict(quiet, **(env or {}))):
+            lf.run(True, 1, 10)
+        return seen["towns"], _logged(lg)
+
+    def test_run_searches_every_town_in_the_map_data(self):
+        towns, logged = self._run_logging_picks(["Crewe"])
+        self.assertEqual(towns, ["Crewe", "Chester", "Nantwich"])
+        self.assertIn("towns to search: 3 (1 from config.json + 2 more from the map data)", logged)
+
+    def test_whole_country_search_can_be_switched_off(self):
+        towns, logged = self._run_logging_picks(["Crewe"], env={"WHOLE_COUNTRY": "0"})
+        self.assertEqual(towns, ["Crewe"])
+        self.assertNotIn("towns to search", logged)
+
+    def test_without_the_map_data_only_the_configured_towns_are_searched(self):
+        cfg = {"trades": [], "towns": ["Crewe"], "queue_tab": "q", "tracker_tab": "t"}
+        seen = {}
+        with mock.patch.object(lf, "load_config", return_value=cfg), mock.patch.object(lf, "log"), \
+                mock.patch.object(lf, "pick_with_retries", side_effect=lambda c, st, n: (seen.update(towns=list(c["towns"])) or [], 0)), \
+                mock.patch.object(lf, "load_state", return_value={}), \
+                mock.patch.dict(os.environ, {"COMPANIES_HOUSE_API_KEY": "", "GOOGLE_PLACES_API_KEY": "", "SHEET_ID": "",
+                                             "GOOGLE_SERVICE_ACCOUNT_JSON": ""}):
+            lf.run(True, 1, 10)  # LOCAL_EXTRACT_DIR is the empty temp path from the base class
+        self.assertEqual(seen["towns"], ["Crewe"])
 
 
 if __name__ == "__main__":

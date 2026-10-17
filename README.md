@@ -28,12 +28,12 @@ Finds small UK businesses from several free sources, merges them, pulls a real e
 
 ## Tuning
 
-- `config.json`: trades and towns. Each run works through the next `COMBOS_PER_RUN` (trade, town) pairs and remembers its place in `state.json`.
+- `config.json`: trades and towns. Each run works through the next `COMBOS_PER_RUN` (trade, town) pairs and remembers its place in `state.json`. The towns from `config.json` come first, then the other cities and towns found in the map data, so adding a town to the end of the list never loses the saved position.
 - `MAX_NEW_PER_RUN` (40) and `MAX_SITES_PER_RUN` (120) cap volume and run time.
 
 ## Limits to know about
 
 - OpenStreetMap coverage of small UK trades is patchy. Treat it as a bonus source, not the foundation.
-- **Where the OpenStreetMap data comes from.** The public Overpass servers are free but often overloaded or down for hours, so the workflow also downloads the free Geofabrik Great Britain extract about once a week (`tools/build_osm_extract.sh`, cached by GitHub Actions) and searches that file directly (a 3 km circle round each town's place point, 6 km for a city). Overpass is only used for towns that are not in the file (Northern Ireland) or when the file is missing; set `LOCAL_OSM=0` to force Overpass. The run log says which one it used ("local OSM extract: ... built <date>").
+- **Where the OpenStreetMap data comes from.** The public Overpass servers are free but often overloaded or down for hours, so the workflow also downloads the free Geofabrik Great Britain extract about once a week (`tools/build_osm_extract.sh`, cached by GitHub Actions) and searches that file directly (a 3 km circle round each town's place point, 6 km for a city). While the file is available it searches **every city and town in Great Britain** (about 1,600), not just the ones listed in `config.json`; set `WHOLE_COUNTRY=0` to go back to the listed towns only. Overpass is only used for towns that are not in the file (Northern Ireland) or when the file is missing; set `LOCAL_OSM=0` to force Overpass. The run log says which one it used ("local OSM extract: ... built <date>").
 - Google's terms restrict how long Places data can be stored. Check them before relying on that source long term.
 - Cold email to sole traders/partnerships needs consent under PECR. Every email must clearly identify you and offer a way to opt out.
